@@ -1,0 +1,7 @@
+# Athletics sites for `scrapbot run coaches --seeds seeds/schools.txt`
+# One per line. Domain or full URL; '#' starts a comment.
+#
+# Use the *athletics* host, not the university host — the staff directory
+# lives there (goduke.com, not duke.edu).
+
+goduke.com

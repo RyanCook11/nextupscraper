@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>scrapbot — leads</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f7f8fa;
+    --panel: #ffffff;
+    --border: #e2e5ea;
+    --text: #1a1d21;
+    --muted: #6b7280;
+    --accent: #2f6feb;
+    --good: #197b4b;
+    --warn: #9a6400;
+    --radius: 10px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --panel: #1c1f24;
+      --border: #2c3138;
+      --text: #e8eaed;
+      --muted: #9aa3ae;
+      --accent: #6f9bff;
+      --good: #4bd08b;
+      --warn: #e0b055;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    font: 14px/1.5 -apple-system, "Segoe UI", Roboto, system-ui, sans-serif;
+    background: var(--bg); color: var(--text);
+  }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 20px; }
+  .tiles { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); margin-bottom: 20px; }
+  .tile { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; }
+  .tile .n { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tile .l { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
+  input[type=search], select {
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font: inherit;
+  }
+  input[type=search] { min-width: 240px; flex: 1 1 240px; }
+  label.chk { display: inline-flex; gap: 6px; align-items: center; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px; cursor: pointer; user-select: none; }
+  a.btn { text-decoration: none; background: var(--accent); color: #fff; border-radius: 8px; padding: 8px 12px; font-weight: 500; }
+  .wrap { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; min-width: 940px; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { position: sticky; top: 0; background: var(--panel); font-size: 12px; text-transform: uppercase;
+       letter-spacing: .04em; color: var(--muted); cursor: pointer; white-space: nowrap; }
+  tbody tr:hover { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+  td.company { font-weight: 600; }
+  td small { color: var(--muted); display: block; font-weight: 400; }
+  .pill { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px;
+          border: 1px solid var(--border); color: var(--muted); margin: 0 3px 3px 0; white-space: nowrap; }
+  .pill.hiring { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, transparent); }
+  a { color: var(--accent); }
+  .empty { padding: 40px; text-align: center; color: var(--muted); }
+  code { background: color-mix(in srgb, var(--muted) 15%, transparent); padding: 1px 5px; border-radius: 4px; }
+  .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .tab { appearance: none; background: none; border: 0; border-bottom: 2px solid transparent;
+         color: var(--muted); font: inherit; font-weight: 500; padding: 9px 14px; cursor: pointer; }
+  .tab[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab .badge { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .pill.coach { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, transparent); }
+  td.name { font-weight: 600; }
+</style>
+</head>
+<body>
+  <h1>scrapbot</h1>
+  <div class="sub" id="src">loading…</div>
+
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" data-tab="contacts" aria-selected="true">
+      Coaches <span class="badge" id="badge-contacts"></span></button>
+    <button class="tab" role="tab" data-tab="schools" aria-selected="false">
+      Schools <span class="badge" id="badge-schools"></span></button>
+    <button class="tab" role="tab" data-tab="leads" aria-selected="false">
+      Companies <span class="badge" id="badge-leads"></span></button>
+  </div>
+
+  <div class="tiles" id="tiles"></div>
+
+  <div class="bar">
+    <input type="search" id="q" placeholder="Search…" />
+    <select id="industry" hidden><option value="">All industries</option></select>
+    <select id="sport" hidden><option value="">All sports</option></select>
+    <select id="division" hidden><option value="">All divisions</option></select>
+    <label class="chk" id="w-coaches"><input type="checkbox" id="coaches_only" /> Coaches only</label>
+    <label class="chk" id="w-email"><input type="checkbox" id="has_email" /> Has email</label>
+    <label class="chk" id="w-phone"><input type="checkbox" id="has_phone" /> Has phone</label>
+    <label class="chk" id="w-hiring"><input type="checkbox" id="hiring" /> Hiring signals</label>
+    <a class="btn" id="csv" href="/api/export.csv">Download CSV</a>
+  </div>
+
+  <div class="wrap">
+    <table>
+      <thead><tr id="head"></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div class="empty" id="empty" hidden></div>
+  </div>
+
+<script>
+const el = (id) => document.getElementById(id);
+let tab = "contacts", sortKey = "name", sortDir = 1, rows = [], stats = {};
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function cell(v) { return Array.isArray(v) ? v.map(esc).join("<br>") : esc(v ?? ""); }
+function when(t) { return esc(String(t || "").replace("T", " ").replace("+00:00", "")); }
+
+/* Each tab declares its own columns, filters, sort and row renderer. */
+const VIEWS = {
+  contacts: {
+    key: "contacts", sort: "name", endpoint: "/api/contacts",
+    filters: ["sport", "coaches_only", "has_email", "has_phone"],
+    placeholder: "Search name, title, email, school…",
+    empty: 'No coaches yet. Run <code>scrapbot run coaches --sites goduke.com</code> then refresh.',
+    columns: [["name", "Name"], ["title", "Title"], ["sport", "Sport"],
+              ["emails", "Email"], ["phones", "Phone"], ["school", "School"]],
+    tiles: (s) => [["Contacts", s.contacts.total], ["Coaching roles", s.contacts.coaches],
+                   ["With email", s.contacts.with_email], ["With phone", s.contacts.with_phone],
+                   ["Schools", s.contacts.schools]],
+    row: (c) => `<tr>
+      <td class="name">${esc(c.name)}
+        ${c.profile_url ? `<small><a href="${esc(c.profile_url)}" target="_blank" rel="noopener">profile</a></small>` : ""}
+        <div>${c.is_coach ? '<span class="pill coach">coach</span>' : ""}</div></td>
+      <td>${esc(c.title || "")}</td>
+      <td>${esc(c.sport || c.department || "")}</td>
+      <td>${(c.emails || []).map((e) => `<a href="mailto:${esc(e)}">${esc(e)}</a>`).join("<br>")}
+        ${c.shared_email ? '<small title="This address is on several people\'s rows at this school — an assistant or a shared inbox">shared inbox</small>' : ""}</td>
+      <td>${cell(c.phones)}</td>
+      <td>${esc(c.school || "")}<small>${esc(c.school_domain || "")}</small></td>
+    </tr>`,
+  },
+  schools: {
+    key: "schools", sort: "school", endpoint: "/api/schools",
+    filters: ["division"],
+    placeholder: "Search school, conference, state…",
+    empty: 'No schools yet. Run <code>scrapbot run schools --division I</code> then refresh.',
+    columns: [["school", "School"], ["division", "Div"], ["conference", "Conference"],
+              ["state", "State"], ["totalYearlyCost", "Yearly cost"], ["academicData", "Academics"]],
+    tiles: (s) => [["Schools", s.schools.total], ["With cost", s.schools.with_cost],
+                   ["With scores", s.schools.with_academics], ["With athletics site", s.schools.with_site]],
+    row: (s) => `<tr>
+      <td class="name">${esc(s.school)}
+        <small>${esc(s.city || "")}${s.city && s.region ? " · " : ""}${esc(s.region || "")}</small>
+        ${s.athletics_domain ? `<small><a href="https://${esc(s.athletics_domain)}" target="_blank" rel="noopener">${esc(s.athletics_domain)}</a></small>` : ""}</td>
+      <td>${esc(s.division || "")}</td>
+      <td>${esc(s.conference || "")}</td>
+      <td>${esc(s.state || "")}</td>
+      <td>${esc(s.totalYearlyCost || "")}<small>${esc(s.privatePublic || "")}</small></td>
+      <td>${Object.entries(s.academicData || {}).map(([k, v]) =>
+            `<span class="pill">${esc(k)} ${esc(v)}</span>`).join("")}</td>
+    </tr>`,
+  },
+  leads: {
+    key: "leads", sort: "company_name", endpoint: "/api/leads",
+    filters: ["industry", "has_email", "has_phone", "hiring"],
+    placeholder: "Search company, domain, email, location…",
+    empty: 'Nothing here yet. Run <code>scrapbot run website --seeds seeds/domains.txt</code> then refresh.',
+    columns: [["company_name", "Company"], ["emails", "Email"], ["phones", "Phone"],
+              ["location", "Location"], ["industry_hints", "Industry"], ["last_seen", "Last seen"]],
+    tiles: (s) => [["Total leads", s.total], ["With email", s.with_email],
+                   ["With phone", s.with_phone], ["LinkedIn", s.with_linkedin], ["Hiring signals", s.hiring]],
+    row: (l) => `<tr>
+      <td class="name">${esc(l.company_name || l.domain)}
+        <small>${l.url ? `<a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.domain)}</a>` : esc(l.domain)}</small>
+        <small>${esc((l.description || "").slice(0, 120))}</small>
+        <div>${Object.entries(l.socials || {}).map(([k, v]) =>
+              `<a class="pill" href="${esc(v)}" target="_blank" rel="noopener">${esc(k)}</a>`).join("")}
+             ${l.has_open_roles ? '<span class="pill hiring">hiring</span>' : ""}</div></td>
+      <td>${cell(l.emails)}</td>
+      <td>${cell(l.phones)}</td>
+      <td>${cell(l.location)}</td>
+      <td>${(l.industry_hints || []).map((i) => `<span class="pill">${esc(i)}</span>`).join("")}</td>
+      <td><small>${when(l.last_seen)}</small></td>
+    </tr>`,
+  },
+};
+
+const ALL_FILTERS = {
+  industry: "industry", sport: "sport", division: "division",
+  coaches_only: "w-coaches", has_email: "w-email", has_phone: "w-phone", hiring: "w-hiring",
+};
+
+function params() {
+  const view = VIEWS[tab];
+  const p = new URLSearchParams();
+  if (el("q").value.trim()) p.set("search", el("q").value.trim());
+  for (const f of view.filters) {
+    const node = el(f);
+    if (node.type === "checkbox") { if (node.checked) p.set(f, "true"); }
+    else if (node.value) p.set(f, node.value);
+  }
+  return p;
+}
+
+function applyVisibility() {
+  const active = new Set(VIEWS[tab].filters);
+  for (const [name, wrapId] of Object.entries(ALL_FILTERS)) {
+    const node = el(wrapId);
+    if (node) node.hidden = !active.has(name);
+  }
+  el("q").placeholder = VIEWS[tab].placeholder;
+  el("empty").innerHTML = VIEWS[tab].empty;
+  el("head").innerHTML = VIEWS[tab].columns
+    .map(([k, label]) => `<th data-k="${k}">${label}</th>`).join("");
+  document.querySelectorAll("th[data-k]").forEach((th) => th.addEventListener("click", () => {
+    sortDir = th.dataset.k === sortKey ? -sortDir : 1;
+    sortKey = th.dataset.k;
+    render();
+  }));
+}
+
+function render() {
+  const view = VIEWS[tab];
+  rows.sort((a, b) => {
+    const pick = (r) => {
+      const v = r[sortKey];
+      if (Array.isArray(v)) return v[0] ?? "";
+      if (v && typeof v === "object") return Object.values(v)[0] ?? "";
+      return v ?? "";
+    };
+    const av = String(pick(a)).toLowerCase(), bv = String(pick(b)).toLowerCase();
+    return av < bv ? -sortDir : av > bv ? sortDir : 0;
+  });
+  el("rows").innerHTML = rows.map(view.row).join("");
+  el("empty").hidden = rows.length > 0;
+}
+
+async function loadRows() {
+  const view = VIEWS[tab];
+  const p = params();
+  const csv = new URLSearchParams(p);
+  csv.set("dataset", view.key);
+  el("csv").href = "/api/export.csv?" + csv.toString();
+
+  const data = await (await fetch(view.endpoint + "?" + p.toString())).json();
+  rows = data[view.key] || [];
+  el("src").textContent =
+    `${data.total} ${view.key === "leads" ? "lead" : view.key.replace(/s$/, "")}(s) matching · data in ${stats.data_dir || "data/"}`;
+  render();
+}
+
+function renderTiles() {
+  el("tiles").innerHTML = VIEWS[tab].tiles(stats)
+    .map(([l, n]) => `<div class="tile"><div class="n">${n ?? 0}</div><div class="l">${l}</div></div>`)
+    .join("");
+}
+
+function fillSelect(id, label, counts) {
+  el(id).innerHTML = `<option value="">${label}</option>` +
+    Object.entries(counts || {}).map(([k, v]) => `<option value="${esc(k)}">${esc(k)} (${v})</option>`).join("");
+}
+
+async function loadStats() {
+  stats = await (await fetch("/api/stats")).json();
+  el("badge-contacts").textContent = stats.contacts.total;
+  el("badge-schools").textContent = stats.schools.total;
+  el("badge-leads").textContent = stats.total;
+  fillSelect("industry", "All industries", stats.industries);
+  fillSelect("sport", "All sports", stats.contacts.sports);
+  fillSelect("division", "All divisions", stats.schools.divisions);
+  renderTiles();
+}
+
+function selectTab(next) {
+  tab = next;
+  sortKey = VIEWS[tab].sort;
+  sortDir = 1;
+  document.querySelectorAll(".tab").forEach((t) =>
+    t.setAttribute("aria-selected", String(t.dataset.tab === tab)));
+  applyVisibility();
+  renderTiles();
+  loadRows();
+}
+
+let timer;
+el("q").addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(loadRows, 250); });
+for (const id of ["industry", "sport", "division", "coaches_only", "has_email", "has_phone", "hiring"])
+  el(id).addEventListener("change", loadRows);
+document.querySelectorAll(".tab").forEach((t) =>
+  t.addEventListener("click", () => selectTab(t.dataset.tab)));
+
+loadStats().then(() => selectTab("contacts"));
+</script>
+</body>
+</html>

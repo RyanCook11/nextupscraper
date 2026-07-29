@@ -1,0 +1,3 @@
+# One company domain or URL per line. '#' starts a comment.
+# Replace these with your real target companies.
+example.com
