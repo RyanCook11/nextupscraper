@@ -71,6 +71,51 @@
   .tab .badge { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
   .pill.coach { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, transparent); }
   td.name { font-weight: 600; }
+  .who { display: flex; gap: 8px; align-items: flex-start; }
+  /* Headshots are remote and arbitrary-sized; fix the box so one tall image
+     cannot stretch its row. onerror removes the tag if the host 403s hotlinks. */
+  .shot { width: 40px; height: 40px; border-radius: 50%; object-fit: cover;
+          flex: 0 0 auto; background: var(--line); }
+  .pill.ok      { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, transparent); }
+  .pill.blocked,
+  .pill.error   { color: #c0392b; border-color: color-mix(in srgb, #c0392b 45%, transparent); }
+  .pill.network { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+  .pill.retry   { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+  .hint { color: var(--muted); font-size: 12px; margin: -8px 0 14px; }
+  .hint code { user-select: all; }
+  button.act { cursor: pointer; font: inherit; }
+  button.pill.act { background: none; }
+  button.pill.act:hover { background: color-mix(in srgb, var(--accent) 15%, transparent); }
+  button.btn { border: 0; }
+  button:disabled { opacity: .55; cursor: progress; }
+  .job { margin: -8px 0 14px; font-size: 13px; }
+  .job.err { color: #c0392b; }
+  th[data-k]::after { content: ""; }
+  th[aria-sort]::after { content: " ↑"; }
+  th[aria-sort="descending"]::after { content: " ↓"; }
+
+  /* --- pagination ------------------------------------------------------- */
+  .pager { margin: 16px 0 4px; text-align: center; }
+  .pager-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: center; }
+  .pager button, .pager .gap {
+    font: inherit; font-weight: 500; min-width: 38px; height: 34px; padding: 0 11px;
+    border-radius: 8px; border: 1px solid var(--border); background: var(--panel);
+    color: var(--text); cursor: pointer; font-variant-numeric: tabular-nums;
+  }
+  .pager button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .pager button[aria-current="page"] {
+    background: var(--accent); border-color: var(--accent); color: #fff; cursor: default;
+  }
+  .pager button:disabled { opacity: .45; cursor: default; }
+  .pager .gap { border: 0; background: none; color: var(--muted); cursor: default; min-width: 0; padding: 0 2px; }
+  .pager .goto { display: inline-flex; gap: 6px; align-items: center; margin-left: 10px; color: var(--muted); }
+  .pager .goto input {
+    width: 62px; height: 34px; text-align: center; font: inherit; font-variant-numeric: tabular-nums;
+    background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+  }
+  .pager .goto button#go { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .pager .caption { color: var(--muted); font-size: 13px; margin-top: 8px; }
+  .pager .caption b { color: var(--accent); font-weight: 500; }
 </style>
 </head>
 <body>
@@ -84,20 +129,33 @@
       Schools <span class="badge" id="badge-schools"></span></button>
     <button class="tab" role="tab" data-tab="leads" aria-selected="false">
       Companies <span class="badge" id="badge-leads"></span></button>
+    <button class="tab" role="tab" data-tab="sites" aria-selected="false">
+      Runs <span class="badge" id="badge-sites"></span></button>
   </div>
 
   <div class="tiles" id="tiles"></div>
+  <div class="hint" id="hint" hidden></div>
+  <div class="job" id="job" hidden></div>
 
   <div class="bar">
     <input type="search" id="q" placeholder="Search…" />
     <select id="industry" hidden><option value="">All industries</option></select>
     <select id="sport" hidden><option value="">All sports</option></select>
     <select id="division" hidden><option value="">All divisions</option></select>
+    <select id="run" hidden><option value="">Latest run</option></select>
+    <select id="status" hidden><option value="">All outcomes</option></select>
     <label class="chk" id="w-coaches"><input type="checkbox" id="coaches_only" /> Coaches only</label>
     <label class="chk" id="w-email"><input type="checkbox" id="has_email" /> Has email</label>
     <label class="chk" id="w-phone"><input type="checkbox" id="has_phone" /> Has phone</label>
     <label class="chk" id="w-hiring"><input type="checkbox" id="hiring" /> Hiring signals</label>
+    <select id="per_page" title="Rows per page">
+      <option value="20">20 / page</option>
+      <option value="50" selected>50 / page</option>
+      <option value="100">100 / page</option>
+      <option value="300">300 / page</option>
+    </select>
     <a class="btn" id="csv" href="/api/export.csv">Download CSV</a>
+    <button class="btn act" id="retry-all" hidden>Retry all failed</button>
   </div>
 
   <div class="wrap">
@@ -108,9 +166,15 @@
     <div class="empty" id="empty" hidden></div>
   </div>
 
+  <nav class="pager" id="pager" aria-label="Pagination" hidden></nav>
+
 <script>
 const el = (id) => document.getElementById(id);
 let tab = "contacts", sortKey = "name", sortDir = 1, rows = [], stats = {};
+let siteCounts = {}, currentRun = "";
+/* Paging is server side — the browser only ever holds the visible page. */
+let page = 1, perPage = 50, total = 0;
+const RETRYABLE = new Set(["blocked", "network", "error"]);
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -132,9 +196,15 @@ const VIEWS = {
                    ["With email", s.contacts.with_email], ["With phone", s.contacts.with_phone],
                    ["Schools", s.contacts.schools]],
     row: (c) => `<tr>
-      <td class="name">${esc(c.name)}
-        ${c.profile_url ? `<small><a href="${esc(c.profile_url)}" target="_blank" rel="noopener">profile</a></small>` : ""}
-        <div>${c.is_coach ? '<span class="pill coach">coach</span>' : ""}</div></td>
+      <td class="name">
+        <div class="who">
+          ${c.photo_url ? `<img class="shot" src="${esc(c.photo_url)}" alt="" loading="lazy"
+             referrerpolicy="no-referrer" onerror="this.remove()">` : ""}
+          <div>${esc(c.name)}
+            ${c.profile_url ? `<small><a href="${esc(c.profile_url)}" target="_blank" rel="noopener">profile</a></small>` : ""}
+            <div>${c.is_coach ? '<span class="pill coach">coach</span>' : ""}</div>
+          </div>
+        </div></td>
       <td>${esc(c.title || "")}</td>
       <td>${esc(c.sport || c.department || "")}</td>
       <td>${(c.emails || []).map((e) => `<a href="mailto:${esc(e)}">${esc(e)}</a>`).join("<br>")}
@@ -147,21 +217,53 @@ const VIEWS = {
     key: "schools", sort: "school", endpoint: "/api/schools",
     filters: ["division"],
     placeholder: "Search school, conference, state…",
-    empty: 'No schools yet. Run <code>scrapbot run schools --division I</code> then refresh.',
+    empty: 'No schools yet. Run <code>scrapbot run schools</code> then refresh.',
     columns: [["school", "School"], ["division", "Div"], ["conference", "Conference"],
-              ["state", "State"], ["totalYearlyCost", "Yearly cost"], ["academicData", "Academics"]],
-    tiles: (s) => [["Schools", s.schools.total], ["With cost", s.schools.with_cost],
-                   ["With scores", s.schools.with_academics], ["With athletics site", s.schools.with_site]],
+              ["state", "State"], ["totalYearlyCost", "Yearly cost"],
+              ["academicData", "Academics"]],
+    tiles: (s) => [["Schools", s.schools.total], ["With site", s.schools.with_site],
+                   ["With cost", s.schools.with_cost],
+                   ["With scores", s.schools.with_academics]],
     row: (s) => `<tr>
       <td class="name">${esc(s.school)}
         <small>${esc(s.city || "")}${s.city && s.region ? " · " : ""}${esc(s.region || "")}</small>
-        ${s.athletics_domain ? `<small><a href="https://${esc(s.athletics_domain)}" target="_blank" rel="noopener">${esc(s.athletics_domain)}</a></small>` : ""}</td>
+        ${s.athletics_domain ? `<small><a href="https://${esc(s.athletics_domain)}" target="_blank" rel="noopener">${esc(s.athletics_domain)}</a></small>`
+          : (s.website ? `<small><a href="${esc(s.website.startsWith("http") ? s.website : "https://" + s.website)}" target="_blank" rel="noopener">${esc(s.website.replace(/^https?:\/\//, ""))}</a></small>` : "")}</td>
       <td>${esc(s.division || "")}</td>
       <td>${esc(s.conference || "")}</td>
       <td>${esc(s.state || "")}</td>
       <td>${esc(s.totalYearlyCost || "")}<small>${esc(s.privatePublic || "")}</small></td>
       <td>${Object.entries(s.academicData || {}).map(([k, v]) =>
             `<span class="pill">${esc(k)} ${esc(v)}</span>`).join("")}</td>
+    </tr>`,
+  },
+  sites: {
+    key: "sites", sort: "status", endpoint: "/api/sites",
+    filters: ["run", "status"],
+    placeholder: "Search school, domain, reason…",
+    empty: 'No run report yet. The next <code>scrapbot run coaches</code> writes one.',
+    columns: [["domain", "Site"], ["status", "Outcome"], ["detail", "Reason"],
+              ["people", "People"], ["run_id", "Run"]],
+    tiles: (s) => {
+      const c = siteCounts;
+      const attempted = Object.values(c).reduce((a, b) => a + b, 0);
+      const retry = (c.blocked || 0) + (c.network || 0) + (c.error || 0);
+      return [["Sites", attempted], ["Succeeded", c.ok || 0],
+              ["Failed", attempted - (c.ok || 0)],
+              ["Blocked by site", c.blocked || 0], ["Network failures", c.network || 0],
+              ["Worth retrying", retry]];
+    },
+    row: (s) => `<tr>
+      <td class="name">${esc(s.school || s.domain)}
+        ${s.school ? `<small>${esc(s.domain)}</small>` : ""}
+        ${s.url ? `<small><a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.url.slice(0, 60))}</a></small>` : ""}</td>
+      <td><span class="pill ${esc(s.status)}">${esc(s.status)}</span>
+        ${RETRYABLE.has(s.status)
+          ? `<button class="pill retry act" data-retry="${esc(s.domain)}">retry</button>`
+          : ""}</td>
+      <td>${esc(s.detail || "")}</td>
+      <td>${s.people ? esc(s.people) : ""}</td>
+      <td><small>${esc(s.run_id || "")}</small></td>
     </tr>`,
   },
   leads: {
@@ -191,6 +293,7 @@ const VIEWS = {
 
 const ALL_FILTERS = {
   industry: "industry", sport: "sport", division: "division",
+  run: "run", status: "status",
   coaches_only: "w-coaches", has_email: "w-email", has_phone: "w-phone", hiring: "w-hiring",
 };
 
@@ -206,6 +309,66 @@ function params() {
   return p;
 }
 
+function pageCount() { return Math.max(1, Math.ceil(total / perPage)); }
+
+/* Which page buttons to draw: the ends, plus a window around the current page.
+   Gaps between them collapse to an ellipsis, so 7121 pages still fit on one
+   line. */
+function pageWindow() {
+  const last = pageCount();
+  const wanted = new Set([1, 2, page - 1, page, page + 1, last]);
+  const shown = [...wanted].filter((n) => n >= 1 && n <= last).sort((a, b) => a - b);
+  const out = [];
+  let prev = 0;
+  for (const n of shown) {
+    if (prev && n - prev > 1) out.push("…");
+    out.push(n);
+    prev = n;
+  }
+  return out;
+}
+
+function renderPager() {
+  const node = el("pager");
+  const last = pageCount();
+  node.hidden = total === 0;
+  if (node.hidden) { node.innerHTML = ""; return; }
+
+  const button = (label, target, extra = "") =>
+    `<button type="button" data-page="${target}"${extra}>${label}</button>`;
+
+  node.innerHTML = `
+    <div class="pager-row">
+      ${button("‹ Prev", page - 1, page <= 1 ? " disabled" : "")}
+      ${pageWindow().map((n) => n === "…"
+          ? '<span class="gap">…</span>'
+          : button(n, n, n === page ? ' aria-current="page" disabled' : "")).join("")}
+      ${button("Next ›", page + 1, page >= last ? " disabled" : "")}
+      <span class="goto">
+        <label for="goto">Go to</label>
+        <input id="goto" type="number" min="1" max="${last}" value="${page}" />
+        / ${last}
+        <button type="button" id="go">Go</button>
+      </span>
+    </div>
+    <div class="caption">Page ${page} of <b>${last}</b> · ${total.toLocaleString()} row(s)</div>`;
+
+  node.querySelectorAll("[data-page]").forEach((b) =>
+    b.addEventListener("click", () => goTo(Number(b.dataset.page))));
+  el("go").addEventListener("click", () => goTo(Number(el("goto").value)));
+  el("goto").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") { ev.preventDefault(); goTo(Number(el("goto").value)); }
+  });
+}
+
+function goTo(target) {
+  const next = Math.min(pageCount(), Math.max(1, Math.floor(target) || 1));
+  if (next === page) return;
+  page = next;
+  loadRows();
+  el("pager").scrollIntoView({ block: "nearest" });
+}
+
 function applyVisibility() {
   const active = new Set(VIEWS[tab].filters);
   for (const [name, wrapId] of Object.entries(ALL_FILTERS)) {
@@ -219,24 +382,27 @@ function applyVisibility() {
   document.querySelectorAll("th[data-k]").forEach((th) => th.addEventListener("click", () => {
     sortDir = th.dataset.k === sortKey ? -sortDir : 1;
     sortKey = th.dataset.k;
-    render();
+    // A different sort reorders the whole set, so the old page number is
+    // meaningless — start again at the top.
+    page = 1;
+    loadRows();
   }));
+  markSortedColumn();
+}
+
+function markSortedColumn() {
+  document.querySelectorAll("th[data-k]").forEach((th) => {
+    if (th.dataset.k === sortKey) th.setAttribute("aria-sort", sortDir < 0 ? "descending" : "ascending");
+    else th.removeAttribute("aria-sort");
+  });
 }
 
 function render() {
   const view = VIEWS[tab];
-  rows.sort((a, b) => {
-    const pick = (r) => {
-      const v = r[sortKey];
-      if (Array.isArray(v)) return v[0] ?? "";
-      if (v && typeof v === "object") return Object.values(v)[0] ?? "";
-      return v ?? "";
-    };
-    const av = String(pick(a)).toLowerCase(), bv = String(pick(b)).toLowerCase();
-    return av < bv ? -sortDir : av > bv ? sortDir : 0;
-  });
   el("rows").innerHTML = rows.map(view.row).join("");
   el("empty").hidden = rows.length > 0;
+  markSortedColumn();
+  renderPager();
 }
 
 async function loadRows() {
@@ -244,12 +410,41 @@ async function loadRows() {
   const p = params();
   const csv = new URLSearchParams(p);
   csv.set("dataset", view.key);
-  el("csv").href = "/api/export.csv?" + csv.toString();
+  el("csv").href = "/api/export.csv?" + csv.toString();   // export ignores paging
+
+  p.set("sort", sortKey);
+  p.set("order", sortDir < 0 ? "desc" : "asc");
+  p.set("limit", perPage);
+  p.set("offset", (page - 1) * perPage);
 
   const data = await (await fetch(view.endpoint + "?" + p.toString())).json();
   rows = data[view.key] || [];
+  total = data.total ?? rows.length;
+  // Filters can shrink the set under our feet (or a retry can), leaving us
+  // past the end. Snap back to the last real page and refetch.
+  if (page > 1 && !rows.length && total) {
+    page = Math.ceil(total / perPage);
+    return loadRows();
+  }
+  if (tab === "sites") {
+    siteCounts = data.counts || {};
+    currentRun = data.run || "";
+    renderTiles();
+    const retry = (siteCounts.blocked || 0) + (siteCounts.network || 0) + (siteCounts.error || 0);
+    el("retry-all").hidden = !retry;
+    el("retry-all").textContent = `Retry ${retry} failed`;
+    el("hint").hidden = !retry;
+    el("hint").innerHTML = retry
+      ? `${retry} site(s) worth retrying — <code>scrapbot run coaches --seeds data/runs/${esc(currentRun)}/failed.txt</code>`
+      : "";
+  } else {
+    el("hint").hidden = true;
+  }
+  const noun = view.key === "leads" ? "lead" : view.key.replace(/s$/, "");
+  const from = total ? (page - 1) * perPage + 1 : 0;
   el("src").textContent =
-    `${data.total} ${view.key === "leads" ? "lead" : view.key.replace(/s$/, "")}(s) matching · data in ${stats.data_dir || "data/"}`;
+    `${from}–${from + rows.length - (rows.length ? 1 : 0)} of ${total} ${noun}(s) matching` +
+    ` · data in ${stats.data_dir || "data/"}`;
   render();
 }
 
@@ -264,6 +459,19 @@ function fillSelect(id, label, counts) {
     Object.entries(counts || {}).map(([k, v]) => `<option value="${esc(k)}">${esc(k)} (${v})</option>`).join("");
 }
 
+async function loadRuns() {
+  const data = await (await fetch("/api/runs")).json();
+  const withReport = (data.runs || []).filter((r) => r.has_report);
+  el("badge-sites").textContent = withReport.length || "";
+  el("run").innerHTML = '<option value="">Latest run</option>' +
+    withReport.map((r) => {
+      const s = r.sites || {};
+      const tally = s.attempted ? ` — ${s.succeeded}/${s.attempted} ok` : "";
+      return `<option value="${esc(r.run_id)}">${esc(r.run_id)}${esc(tally)}</option>`;
+    }).join("") +
+    (withReport.length > 1 ? '<option value="all">All runs</option>' : "");
+}
+
 async function loadStats() {
   stats = await (await fetch("/api/stats")).json();
   el("badge-contacts").textContent = stats.contacts.total;
@@ -272,6 +480,9 @@ async function loadStats() {
   fillSelect("industry", "All industries", stats.industries);
   fillSelect("sport", "All sports", stats.contacts.sports);
   fillSelect("division", "All divisions", stats.schools.divisions);
+  el("status").innerHTML = '<option value="">All outcomes</option>' +
+    ["ok", "blocked", "network", "robots", "no_directory", "empty", "error"]
+      .map((s) => `<option value="${s}">${s}</option>`).join("");
   renderTiles();
 }
 
@@ -279,21 +490,107 @@ function selectTab(next) {
   tab = next;
   sortKey = VIEWS[tab].sort;
   sortDir = 1;
+  page = 1;
   document.querySelectorAll(".tab").forEach((t) =>
     t.setAttribute("aria-selected", String(t.dataset.tab === tab)));
   applyVisibility();
-  renderTiles();
+  el("csv").hidden = tab === "sites";
+  el("retry-all").hidden = true;
+  if (tab !== "sites") renderTiles();
   loadRows();
 }
 
+/* --- retry ------------------------------------------------------------- */
+let polling = null;
+
+function setBusy(busy) {
+  document.querySelectorAll("button.act").forEach((b) => { b.disabled = busy; });
+}
+
+function showJob(html, isError) {
+  const node = el("job");
+  node.hidden = !html;
+  node.className = "job" + (isError ? " err" : "");
+  node.innerHTML = html;
+}
+
+async function startRetry(domains) {
+  setBusy(true);
+  showJob("Starting retry…", false);
+  let data;
+  try {
+    const res = await fetch("/api/retry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ run: currentRun || null, domains: domains || null }),
+    });
+    data = await res.json();
+    if (!res.ok) {
+      showJob(esc(data.error || "retry failed") + (data.detail ? ` — ${esc(data.detail)}` : ""), true);
+      setBusy(false);
+      return;
+    }
+  } catch (e) {
+    showJob("could not reach the server", true);
+    setBusy(false);
+    return;
+  }
+  pollJob(data.job.job_id, data.job.domains.length);
+}
+
+function pollJob(jobId, count) {
+  clearInterval(polling);
+  const started = Date.now();
+  const tick = async () => {
+    let job;
+    try { job = await (await fetch(`/api/jobs/${jobId}`)).json(); }
+    catch (e) { return; }
+
+    const secs = Math.round((Date.now() - started) / 1000);
+    if (job.status === "running") {
+      showJob(`Retrying ${count} site(s)… ${secs}s — scraping is rate limited, this can take a while.`, false);
+      return;
+    }
+
+    clearInterval(polling);
+    polling = null;
+    setBusy(false);
+    if (job.status === "failed") {
+      showJob(`Retry failed: ${esc(job.error || "unknown error")}`, true);
+      return;
+    }
+    showJob(
+      `Retry finished in ${secs}s — ${job.succeeded} succeeded, ${job.failed} still failing, ` +
+      `${job.people} people added. <a href="#" id="job-clear">dismiss</a>`, false);
+    el("job-clear")?.addEventListener("click", (ev) => { ev.preventDefault(); showJob("", false); });
+    // The retry wrote a new run, so refresh the pickers and the table.
+    loadRuns().then(() => { el("run").value = job.run_id || ""; currentRun = job.run_id || ""; reload(); });
+    loadStats();
+  };
+  polling = setInterval(tick, 2000);
+  tick();
+}
+
+document.addEventListener("click", (ev) => {
+  const button = ev.target.closest("[data-retry]");
+  if (button) { ev.preventDefault(); startRetry([button.dataset.retry]); }
+});
+el("retry-all").addEventListener("click", () => startRetry(null));
+
+/* Any change to the query narrows or widens the set, so page 1 is the only
+   page we know still exists. */
+const reload = () => { page = 1; loadRows(); };
+
 let timer;
-el("q").addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(loadRows, 250); });
-for (const id of ["industry", "sport", "division", "coaches_only", "has_email", "has_phone", "hiring"])
-  el(id).addEventListener("change", loadRows);
+el("q").addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(reload, 250); });
+for (const id of ["industry", "sport", "division", "run", "status", "coaches_only", "has_email", "has_phone", "hiring"])
+  el(id).addEventListener("change", reload);
+el("per_page").addEventListener("change", () => { perPage = Number(el("per_page").value); reload(); });
 document.querySelectorAll(".tab").forEach((t) =>
   t.addEventListener("click", () => selectTab(t.dataset.tab)));
 
-loadStats().then(() => selectTab("contacts"));
+perPage = Number(el("per_page").value) || 50;   // browsers restore the old choice
+Promise.all([loadStats(), loadRuns()]).then(() => selectTab("contacts"));
 </script>
 </body>
 </html>

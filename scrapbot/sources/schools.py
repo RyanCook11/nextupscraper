@@ -33,12 +33,25 @@ class SchoolsSource(Source):
     @classmethod
     def add_arguments(cls, parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
+            "--association",
+            nargs="+",
+            default=["ncaa", "naia", "njcaa"],
+            choices=["ncaa", "naia", "njcaa"],
+            metavar="ASSOC",
+            help="Which associations to build (default: all three).",
+        )
+        parser.add_argument(
             "--division",
             nargs="+",
             default=["I", "II", "III"],
             choices=["I", "II", "III"],
             metavar="DIV",
-            help="NCAA divisions to include (default: all three).",
+            help="NCAA divisions to include (default: all three). NAIA has none.",
+        )
+        parser.add_argument(
+            "--naia-pdf",
+            metavar="URL",
+            help="Override the NAIA member-institutions PDF URL (it moves each season).",
         )
         parser.add_argument(
             "--state",
@@ -67,7 +80,14 @@ class SchoolsSource(Source):
         # This source talks to JSON APIs, not web pages, so it uses its own
         # client rather than the HTML fetcher it is handed.
         async with apis.ApiClient(timeout=self.settings.timeout) as client:
-            members = await apis.ncaa_members(client, list(self.args.division))
+            associations = [a.lower() for a in self.args.association]
+            members: list[dict] = []
+            if "ncaa" in associations:
+                members += await apis.ncaa_members(client, list(self.args.division))
+            if "naia" in associations:
+                members += await apis.naia_members(client, self.args.naia_pdf)
+            if "njcaa" in associations:
+                members += await apis.njcaa_members(client)
             members = [m for m in members if self._wanted(m)]
 
             limit = self.args.limit or 0
@@ -124,6 +144,9 @@ class SchoolsSource(Source):
             return school
 
         school.city = (match.get("school.city") or "").strip() or school.city
+        # NAIA members arrive with no website at all — Scorecard supplies it,
+        # and the coaches source hops from there to the athletics site.
+        school.website = (match.get("school.school_url") or "").strip() or school.website
         # Scorecard's state is authoritative over the NCAA's mailing address.
         school.state = usregions.state_name(match.get("school.state")) or school.state
         school.region = usregions.region_for(match.get("school.state")) or school.region
@@ -132,20 +155,30 @@ class SchoolsSource(Source):
         school.privatePublic = apis.private_public(match, record)
 
         if not school.academicData:
-            school.notes.append("no test scores published (test-optional reporting)")
+            # Two-year colleges are open-admission and so publish no admissions
+            # test scores at all; four-year schools that report nothing are
+            # usually test-optional. Different causes, so say which.
+            school.notes.append(
+                "no admissions test scores — open-admission two-year college"
+                if school.association == "NJCAA"
+                else "no test scores published (test-optional reporting)"
+            )
         return school
 
 
 def _base_school(record: dict, source: str) -> School:
-    """Everything the NCAA directory alone can tell us."""
+    """Everything the member list alone can tell us (NCAA or NAIA)."""
     state = apis.ncaa_state(record)
     return School(
         school=(record.get("nameOfficial") or "").strip(),
+        # NJCAA records carry a city; the NCAA directory does not.
+        city=(record.get("city") or "").strip() or None,
         state=usregions.state_name(state),
         region=usregions.region_for(state),
         division=apis.ncaa_division(record),
         conference=(record.get("conferenceName") or "").strip() or None,
         privatePublic=apis.private_public(None, record),
+        association=record.get("association") or "NCAA",
         athletics_domain=apis.ncaa_domain(record),
         website=(record.get("webSiteUrl") or "").strip() or None,
         ncaa_org_id=record.get("orgId"),

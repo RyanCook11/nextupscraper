@@ -67,7 +67,31 @@ def build_parser() -> argparse.ArgumentParser:
     seeds.add_argument("--out", type=Path, required=True, help="Seed file to write.")
     seeds.add_argument("--division", nargs="+", metavar="DIV", help="Only these divisions.")
     seeds.add_argument("--state", nargs="+", metavar="ST", help="Only these states.")
+    seeds.add_argument(
+        "--from-failures",
+        nargs="*",
+        metavar="STATUS",
+        help="Instead of the school store, collect hosts that failed across all "
+        "stored runs (default statuses: blocked error network). Hosts that "
+        "succeeded in any run are left out.",
+    )
     seeds.set_defaults(func=cmd_seeds)
+
+    # --- import ----------------------------------------------------------
+    imp = sub.add_parser(
+        "import-schools",
+        help="Fill in athletics sites from a spreadsheet (.xlsx or .csv).",
+        parents=[common],
+    )
+    imp.add_argument("file", type=Path, help="Spreadsheet with School / State / link columns.")
+    imp.add_argument(
+        "--add-new",
+        action="store_true",
+        help="Also create schools the list has that the store does not. Off by "
+        "default: the official directories decide who exists.",
+    )
+    imp.add_argument("--dry-run", action="store_true", help="Report but write nothing.")
+    imp.set_defaults(func=cmd_import_schools)
 
     # --- export ----------------------------------------------------------
     export = sub.add_parser(
@@ -224,11 +248,46 @@ def cmd_run(args: argparse.Namespace) -> int:
         School: "scrapbot stats --schools",
     }.get(record_cls, "scrapbot dashboard")
 
+    _print_site_report(result)
+
     if result.out_dir:
         print(f"  snapshot        : {result.out_dir}")
         print(f"  merged store    : {store_path}")
         print(f"\nReview it with: {review}")
     return 0
+
+
+def _print_site_report(result) -> None:
+    """Per-site success and failure, so a blocked site is never invisible."""
+    if not result.outcomes:
+        return
+
+    grouped = result.by_status()
+    succeeded, failed = result.succeeded, result.failed
+
+    print()
+    print(f"  sites attempted : {len(result.outcomes)}")
+    print(f"    succeeded     : {len(succeeded)} ({_pct(len(succeeded), len(result.outcomes))})")
+    print(f"    failed        : {len(failed)}")
+
+    for status, items in sorted(grouped.items(), key=lambda kv: -len(kv[1])):
+        if status == models.SiteOutcome.OK:
+            continue
+        label = models.OUTCOME_LABELS.get(status, status)
+        print(f"      {label:<38} {len(items)}")
+        for outcome in items[:3]:
+            print(f"        - {outcome.domain}: {outcome.detail[:70]}")
+        if len(items) > 3:
+            print(f"        ... and {len(items) - 3} more")
+
+    if result.retryable:
+        print(
+            f"\n  {len(result.retryable)} failure(s) are worth retrying "
+            "(blocked, timed out, or errored)."
+        )
+    if result.out_dir:
+        print(f"  per-site detail : {result.out_dir / 'sites.json'}")
+        print(f"  retry list      : {result.out_dir / 'failed.txt'}")
 
 
 def cmd_stats(args: argparse.Namespace) -> int:
@@ -265,9 +324,115 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_import_schools(args: argparse.Namespace) -> int:
+    """Merge athletics sites from a supplied list into the school store."""
+    from . import importer
+
+    if not args.file.exists():
+        print(f"no such file: {args.file}", file=sys.stderr)
+        return 1
+
+    settings = settings_from_args(args)
+    store = storage.SchoolStore(settings).load()
+    schools = store.sorted_leads()
+    if not schools and not args.add_new:
+        print(
+            f"No schools stored yet in {settings.data_dir}. Run `scrapbot run schools` "
+            "first, or pass --add-new to build the store from this file.",
+            file=sys.stderr,
+        )
+        return 1
+
+    updates, report = importer.import_schools(args.file, schools, add_new=args.add_new)
+    print(report.summary())
+
+    if report.conflicting:
+        print("\n  the list disagrees with the official directory (kept the official one):")
+        for name, current, offered in report.conflicting[:10]:
+            print(f"    {name}: {current}  (list said {offered})")
+        if len(report.conflicting) > 10:
+            print(f"    ... and {len(report.conflicting) - 10} more")
+
+    if report.unmatched and not args.add_new:
+        print(f"\n  {len(report.unmatched)} row(s) matched no stored school, e.g.:")
+        for name in report.unmatched[:5]:
+            print(f"    {name}")
+        print("  re-run with --add-new to add them.")
+
+    if args.dry_run:
+        print("\ndry run — nothing written")
+        return 0
+    if not updates:
+        print("\nnothing to write")
+        return 0
+
+    for school in updates:
+        store.upsert(school)
+    store.save()
+    print(f"\nstore now holds {len(store.sorted_leads())} school(s) -> {settings.schools_path}")
+    print("Regenerate the seed list with: scrapbot seeds --out data/seeds/all-schools.txt")
+    return 0
+
+
+def _failed_hosts(settings: Settings, statuses: list[str]) -> tuple[list[tuple[str, str]], int]:
+    """Hosts that failed in some run and never succeeded in any.
+
+    A site can fail in one batch and succeed in a later retry, so the whole
+    run history is read before deciding — otherwise a second pass would keep
+    chasing sites that are already done.
+    """
+    wanted = {s.lower() for s in statuses}
+    failures: dict[str, str] = {}
+    succeeded: set[str] = set()
+
+    for report in sorted((settings.data_dir / "runs").glob("*/sites.json")):
+        try:
+            rows = json.loads(report.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            log.warning("skipping unreadable run report %s", report)
+            continue
+        for row in rows if isinstance(rows, list) else rows.get("sites", []):
+            domain, status = row.get("domain"), (row.get("status") or "").lower()
+            if not domain:
+                continue
+            if status == "ok":
+                succeeded.add(domain)
+            elif status in wanted:
+                failures[domain] = status
+
+    still_failing = [(d, s) for d, s in sorted(failures.items()) if d not in succeeded]
+    return still_failing, len(failures) - len(still_failing)
+
+
 def cmd_seeds(args: argparse.Namespace) -> int:
     """Turn the school store into a seed file for `scrapbot run coaches`."""
     settings = settings_from_args(args)
+
+    if args.from_failures is not None:
+        statuses = args.from_failures or ["blocked", "error", "network"]
+        hosts, recovered = _failed_hosts(settings, statuses)
+        if not hosts:
+            print(f"No unresolved {'/'.join(statuses)} failures in {settings.data_dir}/runs.")
+            return 0
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(
+            "\n".join(
+                [f"# Hosts still failing ({', '.join(statuses)}) across all stored runs.", ""]
+                + [f"{host}  # {status}" for host, status in hosts]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        counts: dict[str, int] = {}
+        for _host, status in hosts:
+            counts[status] = counts.get(status, 0) + 1
+        print(f"wrote {len(hosts)} host(s) to {args.out}")
+        for status, count in sorted(counts.items(), key=lambda kv: -kv[1]):
+            print(f"  {status:<10} {count}")
+        if recovered:
+            print(f"  ({recovered} earlier failure(s) succeeded later and were skipped)")
+        return 0
+
     schools = storage.SchoolStore(settings).load().sorted_leads()
     if not schools:
         print(
@@ -277,7 +442,7 @@ def cmd_seeds(args: argparse.Namespace) -> int:
         return 1
 
     if args.division:
-        wanted = {d.upper() if d.upper().startswith("D") else f"D{d.upper()}" for d in args.division}
+        wanted = {models.normalize_division(d) for d in args.division}
         schools = [s for s in schools if s.division in wanted]
     if args.state:
         from . import usregions
@@ -285,19 +450,31 @@ def cmd_seeds(args: argparse.Namespace) -> int:
         codes = {usregions.state_code(s) for s in args.state}
         schools = [s for s in schools if usregions.state_code(s.state) in codes]
 
+    from .sources.website import normalize_domain
+
     lines = ["# Generated by `scrapbot seeds` from the school store.", ""]
     missing = 0
+    fallbacks = 0
     for school in schools:
-        if school.athletics_domain:
-            lines.append(f"{school.athletics_domain}  # {school.school}")
+        host = school.athletics_domain
+        if not host:
+            # NAIA members carry no athletics URL, so seed the university host —
+            # the coaches source follows the "Athletics" link from there.
+            host = normalize_domain(school.website or "")
+            if host:
+                fallbacks += 1
+        if host:
+            lines.append(f"{host}  # {school.school}")
         else:
             missing += 1
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"wrote {len(lines) - 2} athletics host(s) to {args.out}")
+    print(f"wrote {len(lines) - 2} host(s) to {args.out}")
+    if fallbacks:
+        print(f"  ({fallbacks} used the university host — no athletics URL on record)")
     if missing:
-        print(f"  ({missing} school(s) had no athletics URL in the NCAA directory)")
+        print(f"  ({missing} school(s) had no usable URL at all)")
     return 0
 
 
@@ -309,15 +486,15 @@ def _school_stats(settings: Settings) -> int:
 
     complete = sum(1 for s in schools if s.totalYearlyCost and s.academicData)
     with_domain = sum(1 for s in schools if s.athletics_domain)
+
     print(f"{len(schools)} school(s) in {settings.schools_path}")
-    print(f"  with cost+scores: {complete} ({_pct(complete, len(schools))})")
-    print(f"  with athletics site: {with_domain} ({_pct(with_domain, len(schools))})")
+    print(f"    with cost+scores  : {complete} ({_pct(complete, len(schools))})")
+    print(f"    with athletics site: {with_domain} ({_pct(with_domain, len(schools))})")
 
     by_division: dict[str, int] = {}
     for school in schools:
-        key = school.division or "unknown"
-        by_division[key] = by_division.get(key, 0) + 1
-    print("\n  by division:")
+        if school.division:
+            by_division[school.division] = by_division.get(school.division, 0) + 1
     for division, count in sorted(by_division.items()):
         print(f"    {division:<10} {count}")
     return 0
@@ -378,7 +555,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 def _export_schools(args: argparse.Namespace, settings: Settings) -> int:
     schools = storage.SchoolStore(settings).load().sorted_leads()
     if args.division:
-        wanted = {d.upper() if d.upper().startswith("D") else f"D{d.upper()}" for d in args.division}
+        wanted = {models.normalize_division(d) for d in args.division}
         schools = [s for s in schools if s.division in wanted]
     if args.search:
         needle = args.search.lower()

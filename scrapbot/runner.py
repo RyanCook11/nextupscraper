@@ -10,7 +10,7 @@ from pathlib import Path
 
 from . import sources, storage
 from .config import Settings
-from .models import Contact, Lead, School
+from .models import Contact, Lead, School, SiteOutcome
 from .net import Fetcher
 
 log = logging.getLogger("scrapbot.runner")
@@ -26,10 +26,30 @@ class RunResult:
     seconds: float = 0.0
     fetch_stats: dict = field(default_factory=dict)
     out_dir: Path | None = None
+    outcomes: list[SiteOutcome] = field(default_factory=list)
 
     @property
     def with_contact(self) -> int:
         return sum(1 for lead in self.leads if lead.emails or lead.phones)
+
+    @property
+    def succeeded(self) -> list[SiteOutcome]:
+        return [o for o in self.outcomes if o.ok]
+
+    @property
+    def failed(self) -> list[SiteOutcome]:
+        return [o for o in self.outcomes if not o.ok]
+
+    @property
+    def retryable(self) -> list[SiteOutcome]:
+        """Failures worth another attempt — blocks, timeouts, crashes."""
+        return [o for o in self.outcomes if o.retryable]
+
+    def by_status(self) -> dict[str, list[SiteOutcome]]:
+        grouped: dict[str, list[SiteOutcome]] = {}
+        for outcome in self.outcomes:
+            grouped.setdefault(outcome.status, []).append(outcome)
+        return grouped
 
 
 async def run_source(
@@ -65,6 +85,7 @@ async def run_source(
             )
         result.fetch_stats = dict(fetcher.stats)
 
+    result.outcomes = list(source.outcomes)
     result.seconds = time.monotonic() - started
     result.new = store.new_count
     result.updated = store.updated_count
@@ -81,6 +102,12 @@ async def run_source(
         {
             "run_id": rid,
             "source": source_name,
+            "sites": {
+                "attempted": len(result.outcomes),
+                "succeeded": len(result.succeeded),
+                "failed": len(result.failed),
+                "by_status": {k: len(v) for k, v in result.by_status().items()},
+            },
             "args": {
                 k: (str(v) if isinstance(v, Path) else v)
                 for k, v in vars(args).items()
@@ -92,6 +119,7 @@ async def run_source(
             "seconds": round(result.seconds, 1),
             "fetch_stats": result.fetch_stats,
         },
+        outcomes=result.outcomes,
     )
     return result
 

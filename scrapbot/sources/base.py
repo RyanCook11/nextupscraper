@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from typing import AsyncIterator
 
 from ..config import Settings
-from ..models import Contact, Lead
+from ..models import Contact, Lead, SiteOutcome
 from ..net import Fetcher
 
 
@@ -25,6 +25,14 @@ class Source(ABC):
     def __init__(self, settings: Settings, args: argparse.Namespace) -> None:
         self.settings = settings
         self.args = args
+        self.outcomes: list[SiteOutcome] = []
+        """One entry per site attempted. The runner turns these into the run
+        report, so a site that blocked us is distinguishable from one that
+        simply had nothing to find."""
+
+    def record(self, outcome: SiteOutcome) -> SiteOutcome:
+        self.outcomes.append(outcome)
+        return outcome
 
     @classmethod
     def add_arguments(cls, parser: argparse.ArgumentParser) -> None:

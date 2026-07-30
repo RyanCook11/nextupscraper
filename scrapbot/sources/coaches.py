@@ -25,6 +25,7 @@ import asyncio
 import logging
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import AsyncIterator, Iterable
 from urllib.parse import urljoin, urlparse
@@ -32,12 +33,46 @@ from urllib.parse import urljoin, urlparse
 from selectolax.parser import HTMLParser
 
 from .. import extract, storage
-from ..models import Contact
+from ..models import Contact, SiteOutcome
 from ..net import Fetcher, Page
 from .base import Source
 from .website import normalize_domain
 
 log = logging.getLogger("scrapbot.coaches")
+
+
+@dataclass
+class Candidate:
+    """A page that parsed into people, and how athletic it turned out to be.
+
+    Discovery judges candidates by this, not by their URL. A university's
+    ``/faculty-staff/`` page looks exactly like a staff directory from the
+    outside — the difference only shows up once the rows are parsed and none of
+    them coach anything.
+    """
+
+    page: Page
+    contacts: list[Contact]
+    school: str | None
+    athletics: bool
+
+
+# A real athletics directory attributes people to sports: Duke 46%, Kentucky
+# 57%, Jacksonville State 60%. Campus directories score exactly 0% — they have
+# no column for it.
+#
+# Coach *ratio* looks like it should work too and does not: Duke is 24.5%
+# coaches and Kentucky 26.8%, but Andrew College's combined faculty list is
+# 25.9%. The two are indistinguishable on that axis, so sport is the only test.
+# Anything failing it still goes through _coaches_only(), which keeps the
+# coaches and drops the professors.
+SPORT_SHARE = 0.10
+
+
+def is_athletics_directory(contacts: list[Contact]) -> bool:
+    if not contacts:
+        return False
+    return sum(1 for c in contacts if c.sport) / len(contacts) >= SPORT_SHARE
 
 # Tried in order against the site root before falling back to link scoring.
 DIRECTORY_PATHS = [
@@ -82,13 +117,78 @@ COLUMN_ALIASES = {
 
 # A group heading is a sport if it looks like one; otherwise it's a department.
 SPORT_WORDS = (
-    "baseball", "basketball", "beach volleyball", "bowling", "cross country",
-    "equestrian", "fencing", "field hockey", "football", "golf", "gymnastics",
-    "ice hockey", "lacrosse", "rifle", "rowing", "rugby", "sailing", "skiing",
-    "soccer", "softball", "squash", "swimming", "diving", "tennis",
-    "track & field", "track and field", "triathlon", "volleyball",
-    "water polo", "wrestling", "crew",
+    "baseball", "basketball", "beach volleyball", "bowling", "cheerleading",
+    "cross country", "equestrian", "fencing", "field hockey", "flag football",
+    "football", "golf", "gymnastics", "ice hockey", "lacrosse", "rifle",
+    "rowing", "rugby", "sailing", "skiing", "soccer", "softball", "squash",
+    "swimming", "diving", "tennis", "track & field", "track and field",
+    "triathlon", "volleyball", "water polo", "wrestling", "crew",
 )
+
+# Every sport name, longest first so "flag football" wins over "football" and
+# "beach volleyball" over "volleyball", with an optional gender qualifier in
+# front. Used to read the sport back out of a job title.
+_GENDER = r"men's|women's|mens|womens|men|women|boys|girls"
+_GENDER_RE = re.compile(rf"\b({_GENDER})\b", re.I)
+# Longest sport first, so "flag football" beats "football" and "beach
+# volleyball" beats "volleyball".
+_SPORTS = "|".join(
+    re.escape(w).replace(r"\ ", r"\s+") for w in sorted(SPORT_WORDS, key=len, reverse=True)
+)
+# Three groups: a shared-program qualifier ("Men's *and* Women's Cross Country"
+# is one coach over two teams, and matching only the adjacent one lost the men),
+# the adjacent qualifier, then the sport.
+_SPORT_IN_TITLE_RE = re.compile(
+    rf"\b(?:({_GENDER})\s*(?:and|&|/)\s*)?(?:({_GENDER})\s+)?({_SPORTS})\b", re.I
+)
+
+
+def _gender(qualifier: str | None) -> str | None:
+    """``Men's``/``mens``/``boys`` -> ``Men``; anything else -> None."""
+    word = (qualifier or "").lower().rstrip("'s").rstrip("s")
+    return {"men": "Men", "boy": "Men", "women": "Women", "girl": "Women"}.get(word)
+
+
+def sport_from_title(title: str | None) -> str | None:
+    """Read the sport out of a job title, for directories that have no column.
+
+    A college with no athletics site of its own lists its coaches on the campus
+    staff page, where the only thing said about the job is the title — see
+    :func:`_coaches_only`. "Head Baseball Coach" is still unambiguous, and one
+    person often covers two programs ("Head Men's Soccer Coach Head Women's
+    Soccer Coach"), so every distinct sport named is kept, in the same
+    semicolon-joined form a directory's own grouping uses.
+    """
+    if not title:
+        return None
+    # Directories overwhelmingly use a typographic apostrophe, so "Men’s
+    # Wrestling" would otherwise lose its qualifier and come out as "Wrestling".
+    text = title.replace("’", "'").replace("ʼ", "'").replace("‘", "'")
+
+    # Keyed on sport *and* gender: one person often runs both programs, and
+    # "Head Men's Soccer Coach Head Women's Soccer Coach" is two jobs, not one.
+    found: list[tuple[str, str | None]] = []
+    for shared, adjacent, sport in _SPORT_IN_TITLE_RE.findall(text):
+        sport = re.sub(r"\s+", " ", sport).strip().title()
+        # "Track & Field" and "track and field" are the same program.
+        sport = sport.replace(" And ", " & ")
+        for qualifier in (shared, adjacent) if shared else (adjacent,):
+            pair = (sport, _gender(qualifier))
+            if pair not in found:
+                found.append(pair)
+
+    # "Women's Asst. Basketball Coach" puts the qualifier a word or two away
+    # from the sport. When the title names exactly one gender and nothing was
+    # matched adjacently, that gender can only belong to the sport(s) named.
+    if found and not any(gender for _, gender in found):
+        genders = {_gender(q) for q in _GENDER_RE.findall(text)} - {None}
+        if len(genders) == 1:
+            only = genders.pop()
+            found = [(sport, only) for sport, _ in found]
+
+    return "; ".join(
+        f"{gender}'s {sport}" if gender else sport for sport, gender in found
+    ) or None
 
 # Titles that make someone a coach rather than support staff.
 COACH_TITLE_RE = re.compile(r"\bcoach(?:es|ing)?\b", re.I)
@@ -104,6 +204,47 @@ NOT_COACH_TITLE_RE = re.compile(
 def is_coaching_title(title: str | None) -> bool:
     text = title or ""
     return bool(COACH_TITLE_RE.search(text)) and not NOT_COACH_TITLE_RE.search(text)
+
+
+# A department banner a card layout runs into the job title. The email and phone
+# already have their own columns, so repeating them in the title is pure noise.
+# Kept deliberately narrow. Widening it to "Academic" ate the first word of
+# "Academic Support Center Professional Tutor", and matching the singular ate
+# the "Athletic" of "Athletic Director" — plural is the banner, singular is an
+# adjective inside a real job title.
+_TITLE_SECTION_RE = re.compile(
+    r"^athletics(?:\s+department)?\b[\s:|/·—–-]*", re.I
+)
+# "Contact:", "Email:", "Phone:" left behind once the value itself is gone. The
+# colon is required, so "Office Manager" survives and "Office:" does not.
+_TITLE_LABEL_RE = re.compile(
+    r"\b(?:e-?mail(?:\s*address)?|phone(?:\s*number)?|telephone|tel|office|"
+    r"cell|mobile|fax|contact)\s*[:.]\s*", re.I
+)
+
+
+def clean_title(text: str | None) -> str | None:
+    """Strip the contact details a directory crams into the title cell.
+
+    Card layouts with no internal markup collapse a whole block into one
+    string, so the title arrived as ``ATHLETICS Head Baseball Coach
+    229-732-5901 adambiss@andrewcollege.edu``. The address and number are
+    already parsed into their own fields; what belongs here is the job.
+    """
+    if not text:
+        return None
+    cleaned = extract.EMAIL_RE.sub(" ", text)
+    cleaned = extract.PHONE_RE.sub(" ", cleaned)
+    cleaned = _TITLE_LABEL_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t-–—·|,;:/")
+
+    # Drop a leading section banner only when a job title is left without it.
+    # "Athletics Director" keeps its first word; "ATHLETICS Head Coach" does not
+    # need one, because the department already has its own column.
+    without = _TITLE_SECTION_RE.sub("", cleaned)
+    if without != cleaned and len(without.split()) >= 2:
+        cleaned = without.strip(" \t-–—·|,;:/")
+    return cleaned or None
 
 # Row-level noise: a directory row that is really a heading or a spacer.
 SKIP_NAME_RE = re.compile(r"^(?:name|staff|full name|\s*)$", re.I)
@@ -155,6 +296,22 @@ class CoachesSource(Source):
         parser.add_argument(
             "--limit", type=int, default=0, help="Stop after this many sites (0 = no limit)."
         )
+        parser.add_argument(
+            "--manual-dir",
+            type=Path,
+            metavar="DIR",
+            help="Parse staff-directory pages you saved from your own browser. "
+            "Layout: DIR/<athletics-domain>/<anything>.html — the folder name "
+            "says which school the page belongs to. Use this for sites that "
+            "refuse automated requests.",
+        )
+        parser.add_argument(
+            "--save-photos",
+            action="store_true",
+            help="Download coach headshots into <data-dir>/photos/. Off by default: "
+            "it roughly doubles the requests per site. The photo URL is always "
+            "recorded either way.",
+        )
 
     # -- seeds ------------------------------------------------------------
     def _load_seeds(self) -> list[str]:
@@ -165,13 +322,16 @@ class CoachesSource(Source):
             if str(seeds_path) == "-":
                 raw.extend(sys.stdin.read().splitlines())
             elif seeds_path.exists():
-                raw.extend(seeds_path.read_text(encoding="utf-8").splitlines())
+                # utf-8-sig: seed files written by Notepad, Excel or PowerShell
+                # start with a BOM, which would otherwise ride along into the
+                # first hostname and make it an invalid IDNA name.
+                raw.extend(seeds_path.read_text(encoding="utf-8-sig").splitlines())
             else:
                 raise SystemExit(f"seed file not found: {seeds_path}")
 
         seen: dict[str, None] = {}
         for line in raw:
-            line = line.split("#", 1)[0].strip()
+            line = line.split("#", 1)[0].strip().lstrip("﻿").strip()
             if not line:
                 continue
             domain = normalize_domain(line)
@@ -179,15 +339,102 @@ class CoachesSource(Source):
                 seen.setdefault(domain, None)
 
         seeds = list(seen)
-        if not seeds and not self.args.directory_url:
+        if not seeds and not self.args.directory_url and not getattr(
+            self.args, "manual_dir", None
+        ):
             raise SystemExit(
-                "no seeds given — pass --seeds FILE, --sites goduke.com, or --directory-url URL"
+                "no seeds given — pass --seeds FILE, --sites goduke.com, "
+                "--directory-url URL, or --manual-dir DIR"
             )
         limit = self.args.limit or 0
         return seeds[:limit] if limit > 0 else seeds
 
     # -- run --------------------------------------------------------------
+    def _manual_pages(self) -> list[tuple[str, Path]]:
+        """``(domain, file)`` for every page saved under ``--manual-dir``.
+
+        The folder name is the school's host, so a saved page needs no flags
+        and no naming convention beyond the directory it sits in.
+        """
+        root: Path | None = getattr(self.args, "manual_dir", None)
+        if root is None:
+            return []
+        if not root.is_dir():
+            raise SystemExit(f"--manual-dir is not a directory: {root}")
+
+        pages: list[tuple[str, Path]] = []
+        for folder in sorted(p for p in root.iterdir() if p.is_dir()):
+            domain = normalize_domain(folder.name)
+            if not domain:
+                log.warning("skipping %s — folder name is not a hostname", folder)
+                continue
+            files = sorted(
+                f for f in folder.iterdir()
+                if f.is_file() and f.suffix.lower() in (".html", ".htm")
+            )
+            if not files:
+                log.warning("no .html saved under %s", folder)
+            pages.extend((domain, f) for f in files)
+
+        loose = [f for f in root.iterdir() if f.is_file() and f.suffix.lower() in (".html", ".htm")]
+        if loose:
+            log.warning(
+                "%d .html file(s) sit directly in %s and were skipped — put each "
+                "page in a folder named after its athletics host",
+                len(loose), root,
+            )
+        return pages
+
+    def scrape_saved(self, domain: str, path: Path) -> list[Contact]:
+        """Parse a page fetched by a person in their own browser.
+
+        No relevance gate here: choosing to save this page *is* the judgement
+        that it is the right one. Links are resolved against the site's own
+        host so profile URLs and headshots still come out absolute.
+        """
+        html = path.read_text(encoding="utf-8", errors="replace")
+        base_url = f"https://{domain}/"
+        tree = extract.parse(html)
+        school = _school_name(tree, domain)
+        contacts = parse_directory(tree, base_url, domain, school, self.name)
+        _flag_shared_emails(contacts)
+
+        if not contacts:
+            log.warning("%s parsed to 0 people — is it the staff directory page?", path)
+            self.record(
+                SiteOutcome(
+                    domain=domain,
+                    status=SiteOutcome.EMPTY,
+                    detail=f"saved page {path.name} had no staff rows",
+                    url=str(path),
+                    school=school,
+                )
+            )
+            return []
+
+        with_email = sum(1 for c in contacts if c.emails)
+        log.info(
+            "%s: %d people (%d with email) from saved page %s",
+            domain, len(contacts), with_email, path.name,
+        )
+        self.record(
+            SiteOutcome(
+                domain=domain,
+                status=SiteOutcome.OK,
+                detail=f"{with_email} with an email address (saved page)",
+                people=len(contacts),
+                url=str(path),
+                school=school,
+            )
+        )
+        return contacts
+
     async def run(self, fetcher: Fetcher) -> AsyncIterator[Contact]:
+        for domain, path in self._manual_pages():
+            for contact in self.scrape_saved(domain, path):
+                if self._wanted(contact):
+                    yield contact
+
         seeds = self._load_seeds()
         jobs: list[tuple[str, str | None]] = [(d, None) for d in seeds]
         for url in self.args.directory_url or []:
@@ -195,6 +442,8 @@ class CoachesSource(Source):
             if domain:
                 jobs.append((domain, url))
 
+        if not jobs:
+            return  # a manual-only run: everything was parsed from disk above
         log.info("scraping %d athletics site(s) with concurrency %d",
                  len(jobs), self.settings.concurrency)
         semaphore = asyncio.Semaphore(self.settings.concurrency)
@@ -203,8 +452,15 @@ class CoachesSource(Source):
             async with semaphore:
                 try:
                     return await self.scrape_site(fetcher, domain, direct)
-                except Exception:  # one broken site must not kill the run
+                except Exception as exc:  # one broken site must not kill the run
                     log.exception("unhandled error scraping %s", domain)
+                    self.record(
+                        SiteOutcome(
+                            domain=domain,
+                            status=SiteOutcome.ERROR,
+                            detail=f"{type(exc).__name__}: {exc}",
+                        )
+                    )
                     return []
 
         tasks = [asyncio.create_task(worker(d, u)) for d, u in jobs]
@@ -247,87 +503,245 @@ class CoachesSource(Source):
                     self._host_map[site] = school.athletics_domain
         return self._host_map
 
+    def _university_host_map(self) -> dict[str, str]:
+        """``wranglersports.net -> cisco.edu`` — the map read backwards.
+
+        Some athletics platforms (PrestoSports behind CloudFront) answer 403 to
+        anything that isn't a browser, even where robots.txt allows the page.
+        We don't work around that. But the college's own campus directory is
+        usually readable and lists the coaches among its staff, so a blocked
+        athletics host is a reason to try the university, not to give up.
+        """
+        return {
+            athletics: site for site, athletics in self._athletics_host_map().items()
+        }
+
     # -- per-site ---------------------------------------------------------
     async def scrape_site(
         self, fetcher: Fetcher, domain: str, direct_url: str | None = None
     ) -> list[Contact]:
+        seed = domain
         if not direct_url:
             mapped = self._athletics_host_map().get(domain)
             if mapped:
                 log.info("%s is a university host — using athletics site %s", domain, mapped)
                 domain = mapped
 
-        page = (
-            await fetcher.get(direct_url)
-            if direct_url
-            else await self._find_directory(fetcher, domain)
-        )
-        if page is None or not page.ok:
-            log.info("no staff directory found for %s", domain)
+        attempts: list[Page] = []
+        if direct_url:
+            # An explicit --directory-url is the operator's decision; take the
+            # page as given rather than second-guessing whether it's athletic.
+            got = await fetcher.get(direct_url)
+            attempts.append(got)
+            found = self._candidate(got, domain) if got.ok else None
+        else:
+            found = await self._find_directory(fetcher, domain, attempts=attempts)
+
+            if found is None and _failure_outcome(seed, attempts).status in (
+                SiteOutcome.BLOCKED,
+                SiteOutcome.ROBOTS,
+            ):
+                university = self._university_host_map().get(domain)
+                if university and university != domain:
+                    log.info(
+                        "%s refused us — trying the college's own site %s",
+                        domain, university,
+                    )
+                    found = await self._find_directory(
+                        fetcher, university, attempts=attempts
+                    )
+                    if found is not None:
+                        domain = university
+
+        if found is None:
+            self.record(_failure_outcome(seed, attempts))
             return []
 
-        tree = extract.parse(page.html)
-        school = _school_name(tree, domain)
-        contacts = parse_directory(tree, page.url, domain, school, self.name)
+        page = found.page
+        school = found.school
+        contacts = found.contacts
         _flag_shared_emails(contacts)
+        if getattr(self.args, "save_photos", False):
+            await self._save_photos(fetcher, contacts)
 
         if not contacts:
             log.info("staff directory at %s parsed to 0 people", page.url)
+            self.record(
+                SiteOutcome(
+                    domain=seed,
+                    status=SiteOutcome.EMPTY,
+                    detail="page fetched but no staff rows recognised",
+                    url=page.url,
+                    school=school,
+                )
+            )
         else:
             with_email = sum(1 for c in contacts if c.emails)
+            kind = "athletics directory" if found.athletics else "general directory, coaches only"
             log.info(
-                "%s: %d people (%d with email) from %s",
-                domain, len(contacts), with_email, page.url,
+                "%s: %d people (%d with email) from %s [%s]",
+                domain, len(contacts), with_email, page.url, kind,
+            )
+            self.record(
+                SiteOutcome(
+                    domain=seed,
+                    status=SiteOutcome.OK,
+                    detail=f"{with_email} with an email address ({kind})",
+                    people=len(contacts),
+                    url=page.url,
+                    school=school,
+                )
             )
         return contacts
 
+    async def _save_photos(self, fetcher: Fetcher, contacts: list[Contact]) -> None:
+        """Download the headshots for one site, sequentially.
+
+        Sequential on purpose: these all come from the same host as the
+        directory we just read, and firing 80 image requests at a college's
+        server in parallel is exactly the behaviour that gets a scraper blocked.
+        """
+        saved = 0
+        for contact in contacts:
+            if not contact.photo_url or contact.photo_file:
+                continue
+            data = await fetcher.get_bytes(contact.photo_url)
+            if not data:
+                continue
+            suffix = Path(urlparse(contact.photo_url).path).suffix.lower()
+            if suffix not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+                suffix = ".jpg"
+            slug = re.sub(r"[^a-z0-9]+", "-", contact.name.lower()).strip("-") or "unnamed"
+            # A hostname can carry a port, and ':' is not legal in a Windows
+            # path — the directory creation fails outright rather than degrading.
+            folder = re.sub(r"[^a-z0-9.-]+", "-", contact.school_domain.lower()).strip("-.")
+            rel = Path("photos") / (folder or "unknown") / f"{slug}{suffix}"
+            target = self.settings.data_dir / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            contact.photo_file = rel.as_posix()
+            saved += 1
+        if saved:
+            log.info("saved %d headshot(s) to %s", saved, self.settings.data_dir / "photos")
+
+    def _candidate(self, page: Page, domain: str) -> Candidate | None:
+        """Parse a fetched page and judge whether it is an athletics directory."""
+        if not _looks_like_directory(page.html):
+            return None
+        tree = extract.parse(page.html)
+        school = _school_name(tree, domain)
+        contacts = parse_directory(tree, page.url, domain, school, self.name)
+        if not contacts:
+            return None
+        return Candidate(
+            page=page,
+            contacts=contacts,
+            school=school,
+            athletics=is_athletics_directory(contacts),
+        )
+
     async def _find_directory(
-        self, fetcher: Fetcher, domain: str, hop: int = 0
-    ) -> Page | None:
-        """Try the well-known paths, then fall back to scoring homepage links."""
-        scheme = await self._working_scheme(fetcher, domain)
-        if scheme is None:
+        self, fetcher: Fetcher, domain: str, hop: int = 0,
+        attempts: list[Page] | None = None,
+        fallback: list[Candidate] | None = None,
+    ) -> Candidate | None:
+        """Try the well-known paths, then fall back to scoring homepage links.
+
+        A candidate is accepted only once it *parses* into athletics staff. The
+        first version returned any page that looked like a directory, so
+        aquinas.edu matched its own ``/faculty-staff/`` page and never got as
+        far as the athletics site at aqsaints.com — 151 professors, no coaches.
+
+        A general campus directory is kept aside in ``fallback`` rather than
+        discarded: small colleges list their coaches there and nowhere else.
+        It's only used if the athletics hunt comes up empty, and then only for
+        the people whose titles say they coach.
+
+        Every response is appended to ``attempts`` so the caller can report
+        *why* nothing was found rather than just reporting zero.
+        """
+        seen: list[Page] = attempts if attempts is not None else []
+        general: list[Candidate] = fallback if fallback is not None else []
+        base = await self._working_base(fetcher, domain, seen)
+        if base is None:
+            return None
+
+        async def consider(page: Page) -> Candidate | None:
+            found = self._candidate(page, domain)
+            if found is None:
+                return None
+            if found.athletics:
+                return found
+            log.debug("%s is a general directory, not athletics", page.url)
+            general.append(found)
             return None
 
         for path in DIRECTORY_PATHS:
-            page = await fetcher.get(f"{scheme}://{domain}{path}")
-            if page.ok and _looks_like_directory(page.html):
-                return page
-            if page.status == 999:  # robots.txt disallow — stop asking
+            page = await fetcher.get(f"{base}{path}")
+            seen.append(page)
+            if page.ok and (hit := await consider(page)) is not None:
+                return hit
+            if page.robots_blocked:  # stop asking; the answer will not change
                 log.info("robots.txt disallows the staff directory on %s", domain)
                 return None
 
-        home = await fetcher.get(f"{scheme}://{domain}/")
-        if not home.ok:
-            return None
-        tree = extract.parse(home.html)
-        for _score, url in _directory_links(tree, home.url, domain):
-            page = await fetcher.get(url)
-            if page.ok and _looks_like_directory(page.html):
-                return page
+        home = await fetcher.get(f"{base}/")
+        seen.append(home)
+        if home.ok:
+            tree = extract.parse(home.html)
+            for _score, url in _directory_links(tree, home.url, domain):
+                page = await fetcher.get(url)
+                seen.append(page)
+                if page.ok and (hit := await consider(page)) is not None:
+                    return hit
 
-        # Still nothing: this may be a university host whose athletics site
-        # lives on another domain and isn't in the school store yet.
-        # One hop only — an athletics site that links back to the university
-        # must not bounce us around forever.
-        athletics = _athletics_host(tree, home.url, domain) if hop == 0 else None
-        if athletics:
-            log.info("following the athletics site link from %s to %s", domain, athletics)
-            return await self._find_directory(fetcher, athletics, hop=1)
+            # This may be a university host whose athletics site lives on
+            # another domain and isn't in the school store yet. One hop only —
+            # an athletics site links back to the university, and without a cap
+            # the two would bounce us around forever.
+            athletics = _athletics_host(tree, home.url, domain) if hop == 0 else None
+            if athletics:
+                log.info("following the athletics site link from %s to %s", domain, athletics)
+                hit = await self._find_directory(
+                    fetcher, athletics, hop=1, attempts=seen, fallback=general
+                )
+                if hit is not None:
+                    return hit
 
-        log.info("no staff-directory link found on %s", home.url)
-        return None
+        return _coaches_only(general, domain)
 
-    async def _working_scheme(self, fetcher: Fetcher, domain: str) -> str | None:
-        """Settle https-vs-http once, so a plain-HTTP host isn't probed twice
-        for every candidate path."""
-        for scheme in ("https", "http"):
-            page = await fetcher.get(f"{scheme}://{domain}/")
-            if page.ok:
-                return scheme
-            if page.status == 999:
-                log.info("robots.txt disallows %s", domain)
-                return None
+    async def _working_base(
+        self, fetcher: Fetcher, domain: str, seen: list[Page]
+    ) -> str | None:
+        """Settle scheme *and* host once, e.g. ``https://www.baynorse.com``.
+
+        Two things are being decided here. https-vs-http, so a plain-HTTP host
+        isn't probed twice for every candidate path — and bare-vs-``www``,
+        because they are not always the same server: baynorse.com resolves to
+        the college's own box (which refuses connections) while
+        www.baynorse.com is on CloudFront. Stripping the ``www`` and stopping
+        there reported the site as a network failure when the truth was a 403,
+        which is a different problem with a different fix.
+        """
+        hosts = [domain]
+        if not domain.startswith("www."):
+            hosts.append(f"www.{domain}")
+
+        for host in hosts:
+            for scheme in ("https", "http"):
+                page = await fetcher.get(f"{scheme}://{host}/")
+                seen.append(page)
+                if page.ok:
+                    if host != domain:
+                        log.info("%s only answers as %s", domain, host)
+                    return f"{scheme}://{host}"
+                if page.robots_blocked:
+                    log.info("robots.txt disallows %s", host)
+                    return None
+                if page.blocked:
+                    # A 403 is an answer: this host exists and is refusing us.
+                    # Trying the other spelling would only collect another 403.
+                    return None
         return None
 
 
@@ -348,21 +762,131 @@ def _parse_tables(
 ) -> list[Contact]:
     out: list[Contact] = []
     for table in tree.css("table"):
-        headers = [_text(th) for th in table.css("th")]
-        mapping, group = _read_headers(headers)
+        rows = table.css("tbody tr") or [r for r in table.css("tr") if r.css("td")]
+        headers = _header_cells(table)
+        mapping, group = _read_headers(headers, _body_width(rows))
         if "name" not in mapping.values():
             continue
-        group = group or _preceding_heading(table)
+        group = group or _table_group(table) or _preceding_heading(table)
 
-        rows = table.css("tbody tr") or [r for r in table.css("tr") if r.css("td")]
+        current = group
         for row in rows:
-            contact = _row_to_contact(row, mapping, group, base_url, domain, school, source)
+            # Some directories are one long table whose sections are marked by a
+            # single-cell row ("Administration", "Men's Basketball") rather than
+            # by a separate table per sport. Kentucky is built this way; Duke is
+            # not. Treat such a row as the running group, not as a person.
+            section = _section_label(row)
+            if section is not None:
+                current = section
+                continue
+            contact = _row_to_contact(row, mapping, current, base_url, domain, school, source)
             if contact is not None:
                 out.append(contact)
     return out
 
 
-def _read_headers(headers: list[str]) -> tuple[dict[int, str], str | None]:
+def _section_label(row) -> str | None:
+    """The group name if this row is a section divider, else None.
+
+    Kentucky marks its sections with a single ``<td>``; Sidearm (aqsaints.com)
+    uses a single ``<th>``. Missing the ``<th>`` form cost every person their
+    sport, which in turn made the page read as a non-athletics directory.
+    """
+    cells = row.css("td") or row.css("th")
+    if len(cells) != 1 or row.css("a[href]"):
+        return None
+    text = _text(cells[0])
+    return text if text and len(text) <= 80 else None
+
+
+# Sidearm splits addresses across two JS variables so they don't sit in the
+# HTML as text. The halves are right there in the row's own <script>, so this
+# needs no browser — and the address is the point of the whole exercise.
+_SPLIT_EMAIL_RE = re.compile(
+    r"""firstHalf\s*=\s*["']([^"']+)["'].*?secondHalf\s*=\s*["']([^"']+)["']""",
+    re.S | re.I,
+)
+
+
+# Directories fill empty headshot slots with a stock silhouette or a logo.
+# Storing those as "the coach's photo" would be worse than storing nothing.
+_PLACEHOLDER_IMAGE_RE = re.compile(
+    r"placeholder|no[-_]?(?:photo|image|headshot)|default|silhouette|blank|"
+    r"generic|spacer|logo|avatar",
+    re.I,
+)
+
+
+def _row_photo(row, base_url: str) -> str | None:
+    """The headshot in this person's row, if it has a real one."""
+    for img in row.css("img"):
+        attrs = img.attributes
+        src = attrs.get("data-src") or attrs.get("src") or ""
+        if not src or src.startswith("data:"):
+            continue
+        if _PLACEHOLDER_IMAGE_RE.search(src) or _PLACEHOLDER_IMAGE_RE.search(
+            attrs.get("alt") or ""
+        ):
+            continue
+        return urljoin(base_url, src).split("?")[0]
+    return None
+
+
+def _emails_from_script(row) -> list[str]:
+    out: list[str] = []
+    for script in row.css("script"):
+        for first, second in _SPLIT_EMAIL_RE.findall(script.text() or ""):
+            out.append(f"{first}@{second}")
+    return out
+
+
+def _header_cells(table) -> list[str]:
+    """The column headers, from the header row only.
+
+    ``table.css("th")`` sweeps up every ``<th>`` in the table, and Sidearm marks
+    each section ("Adminstration", "Campus Ministry", …) with a one-cell ``<th>``
+    row. On aqsaints.com that turned a 5-column header into a 12-entry list and
+    threw the column mapping right off — names came out as email fragments.
+    """
+    head = table.css("thead tr")
+    for row in head or table.css("tr"):
+        cells = row.css("th")
+        if len(cells) >= 2:  # a section divider is a single cell; a header isn't
+            return [_text(c) for c in cells]
+    return []
+
+
+def _table_group(table) -> str | None:
+    """The sport/department this table is for, from its caption row.
+
+    Duke gives each table a one-cell ``<th>`` row ("Men's Basketball") above the
+    real header row. Excluding those from the column headers is right, but the
+    label still has to be read — without it every Duke coach loses their sport,
+    and the page then scores as a non-athletics directory.
+    """
+    caption = table.css_first("caption")
+    if caption is not None and (text := _text(caption)):
+        return text if _usable_group(text) else None
+    for row in table.css("tr"):
+        cells = row.css("th")
+        if len(cells) == 1 and not row.css("td"):
+            text = _text(cells[0])
+            if _usable_group(text):
+                return text
+    return None
+
+
+def _body_width(rows) -> int:
+    """The most common cell count across body rows."""
+    counts: dict[int, int] = {}
+    for row in rows:
+        n = len(row.css("td"))
+        if n > 1:
+            counts[n] = counts.get(n, 0) + 1
+    return max(counts, key=counts.get) if counts else 0
+
+
+def _read_headers(headers: list[str], body_width: int = 0) -> tuple[dict[int, str], str | None]:
     """Map column index -> field name, and pull out the group label if present.
 
     Sidearm puts the sport/department in the first header cell, so a header row
@@ -371,13 +895,27 @@ def _read_headers(headers: list[str]) -> tuple[dict[int, str], str | None]:
     """
     mapping: dict[int, str] = {}
     group: str | None = None
-    known = [h for h in headers if h.strip().lower() in COLUMN_ALIASES]
-    offset = len(headers) - len(known) if known else 0
+    # Header columns only shift when the header row is *wider* than the body —
+    # that's the Sidearm group cell, which body rows don't repeat. Deriving the
+    # shift from the width difference keeps honest layouts honest: aqsaints has
+    # a headerless image column, so its 5 headers line up 1:1 with 5 cells and
+    # must not shift, while "Sport | Name | Title | Email" (5 headers, 4 cells)
+    # must shift by one.
+    #
+    # The old rule counted every unknown header instead, which on a table like
+    # "Name | Title | Department | Email" produced a negative index — cells[-3]
+    # on a short row raises IndexError, and the `i < len(cells)` guard below
+    # cannot catch it.
+    offset = max(0, len(headers) - body_width) if body_width else 0
     for index, header in enumerate(headers):
         field = COLUMN_ALIASES.get(header.strip().lower())
         if field:
             mapping[index - offset] = field
-        elif group is None and header.strip():
+        elif index < offset and group is None and header.strip():
+            # Only a header the body rows do NOT repeat can be the group — that
+            # is the Sidearm sport cell. Treating any unrecognised header as the
+            # group made a campus directory's "Location" or "Department" column
+            # the sport of every person under it (cisco.edu, bigbend.edu).
             group = header.strip()
     return mapping, group
 
@@ -389,14 +927,22 @@ def _row_to_contact(
     cells = row.css("td")
     if not cells:
         return None
-    values = {field: _text(cells[i]) for i, field in mapping.items() if i < len(cells)}
+    # Read the scripts before _text() strips them out of the cells.
+    scripted = _emails_from_script(row)
+    photo = _row_photo(row, base_url)
+    values = {
+        field: _text(cells[i]) for i, field in mapping.items() if 0 <= i < len(cells)
+    }
 
     name = values.get("name", "")
     if not name or SKIP_NAME_RE.match(name):
         return None
 
     contact = _make(name, group, domain, school, source)
-    contact.title = values.get("title") or None
+    contact.title = clean_title(values.get("title"))
+    contact.photo_url = photo
+    for addr in scripted:
+        _add_email(contact, addr)
 
     # Prefer the row's own mailto:/tel: links over its rendered text — the text
     # is sometimes an icon or an "Email" placeholder.
@@ -455,6 +1001,42 @@ def _parse_cards(
 
 # --- helpers -------------------------------------------------------------
 
+def _coaches_only(general: list[Candidate], domain: str) -> Candidate | None:
+    """Last resort: salvage the coaches out of a general campus directory.
+
+    Andrew College publishes one combined faculty/staff list — 54 people, 14 of
+    them coaches, no athletics site of its own. Returning all 54 would file
+    professors as athletics staff; returning nothing would lose 14 real coaches.
+    """
+    for found in general:
+        coaches = [c for c in found.contacts if c.is_coach]
+        if coaches:
+            # Whatever grouped this page ("A-D", "Jump to a Section", a campus
+            # department) is not a sport and not an athletics department. The
+            # title is the only reliable thing a campus row says about the job —
+            # so read the sport back out of it, which is the one place these rows
+            # do state it ("Head Baseball Coach").
+            #
+            # Deliberately here and not in _dedupe: filling sport in earlier
+            # would make a campus faculty page pass is_athletics_directory() and
+            # be scraped whole, professors and all.
+            for coach in coaches:
+                coach.department = None
+                coach.sport = sport_from_title(coach.title)
+                if coach.sport:
+                    note = "sport read from the job title (campus directory, no sport column)"
+                    if note not in coach.notes:
+                        coach.notes.append(note)
+            log.info(
+                "%s: no athletics directory — keeping %d coach(es) of %d from %s",
+                domain, len(coaches), len(found.contacts), found.page.url,
+            )
+            return Candidate(
+                page=found.page, contacts=coaches, school=found.school, athletics=False
+            )
+    return None
+
+
 def _directory_links(tree: HTMLParser, base_url: str, domain: str) -> list[tuple[int, str]]:
     """Same-site links that look like a staff directory, best first."""
     root = domain.split(":")[0].removeprefix("www.").lower()
@@ -481,6 +1063,62 @@ def _directory_links(tree: HTMLParser, base_url: str, domain: str) -> list[tuple
             scored[absolute] = max(scored.get(absolute, 0), score)
 
     return sorted(((s, u) for u, s in scored.items()), key=lambda pair: -pair[0])[:5]
+
+
+def _failure_outcome(domain: str, attempts: list[Page]) -> SiteOutcome:
+    """Say why a site produced nothing, from what its responses looked like.
+
+    Ordered by how actionable it is: a block or a robots rule is a decision
+    someone made, a network failure is worth retrying, and "no directory" only
+    applies once we know the site was actually reachable.
+    """
+    if not attempts:
+        return SiteOutcome(
+            domain=domain, status=SiteOutcome.NETWORK, detail="no requests completed"
+        )
+
+    blocked = [p for p in attempts if p.blocked]
+    if blocked:
+        codes = sorted({p.status for p in blocked})
+        return SiteOutcome(
+            domain=domain,
+            status=SiteOutcome.BLOCKED,
+            detail=f"server refused automated requests (HTTP {', '.join(map(str, codes))})",
+            url=blocked[0].url,
+        )
+
+    if any(p.robots_blocked for p in attempts):
+        return SiteOutcome(
+            domain=domain,
+            status=SiteOutcome.ROBOTS,
+            detail="robots.txt disallows the pages we need",
+            url=attempts[0].url,
+        )
+
+    # Reachable at all? If nothing ever came back, it's the network, not the site.
+    if all(p.network_failed for p in attempts):
+        detail = next((p.error for p in attempts if p.error), "no response")
+        return SiteOutcome(
+            domain=domain, status=SiteOutcome.NETWORK, detail=detail, url=attempts[0].url
+        )
+
+    if not any(p.ok for p in attempts):
+        codes = sorted({p.status for p in attempts if p.status not in (0,)})
+        return SiteOutcome(
+            domain=domain,
+            status=SiteOutcome.NETWORK,
+            detail=f"no page fetched successfully (HTTP {', '.join(map(str, codes))})"
+            if codes
+            else "no page fetched successfully",
+            url=attempts[0].url,
+        )
+
+    return SiteOutcome(
+        domain=domain,
+        status=SiteOutcome.NO_DIRECTORY,
+        detail=f"site reachable but no staff directory found in {len(attempts)} request(s)",
+        url=attempts[0].url,
+    )
 
 
 def _athletics_host(tree: HTMLParser, base_url: str, domain: str) -> str | None:
@@ -524,8 +1162,36 @@ _NOT_ATHLETICS_HOST_RE = re.compile(
 )
 
 
+# "Jr", "III", "PhD" — a comma before one of these is not a surname-first name.
+_NAME_SUFFIX_RE = re.compile(
+    r"^(?:[JS]r|I{1,3}|IV|V|VI{0,3}|Ph\.?D|Ed\.?D|M\.?[DSA]|D\.?M\.?D|CPA|Esq)\.?$",
+    re.I,
+)
+
+
+def normalize_person_name(raw: str) -> str:
+    """``"Baker, Alycia"`` -> ``"Alycia Baker"``.
+
+    Campus directories sort by surname and store the name that way. Left alone
+    it reaches the dashboard as "Baker, Alycia", sorts under B, and never
+    matches a search for the person's actual name.
+
+    Only a single comma with real words either side is flipped, so "Smith, Jr."
+    and "Lee, PhD" are left exactly as they are.
+    """
+    name = " ".join((raw or "").split())
+    if name.count(",") != 1:
+        return name
+    surname, rest = (part.strip() for part in name.split(","))
+    if not surname or not rest or _NAME_SUFFIX_RE.match(rest):
+        return name
+    return f"{rest} {surname}"
+
+
 def _make(name: str, group: str | None, domain: str, school: str | None, source: str) -> Contact:
-    contact = Contact(name=name, school_domain=domain, school=school, source=source)
+    contact = Contact(
+        name=normalize_person_name(name), school_domain=domain, school=school, source=source
+    )
     if group:
         if _is_sport(group):
             contact.sport = group
@@ -540,7 +1206,19 @@ def _is_sport(group: str) -> bool:
 
 
 def _text(node) -> str:
-    return re.sub(r"\s+", " ", (node.text(separator=" ") if node else "") or "").strip()
+    """Visible text of one cell.
+
+    Sidearm hides addresses behind a per-row ``<script>`` that assembles them at
+    render time. ``node.text()`` happily returns that JavaScript, so a coach's
+    email came out as ``var placeholder = document.getElementById(...)``. Drop
+    script/style subtrees before reading the text; the row's ``mailto:`` link is
+    where the real address comes from.
+    """
+    if node is None:
+        return ""
+    for junk in node.css("script, style, noscript, template"):
+        junk.decompose()
+    return re.sub(r"\s+", " ", (node.text(separator=" ") or "")).strip()
 
 
 def _email_ok(addr: str) -> bool:
@@ -590,20 +1268,61 @@ def _ancestors(node) -> Iterable:
         parent = parent.parent
 
 
+# The page's own title is not a group name, and neither is the A–D bucket a
+# campus directory sorts itself into. Both were reaching the dashboard as a
+# coach's department: "Campus Directory" on bigbend.edu, "A-D" on cisco.edu.
+_GENERIC_HEADING = re.compile(
+    r"""^(?:
+        (?:campus\s*|employee\s*|faculty(?:\s*(?:and|&)\s*staff)?\s*|staff\s*)?
+            (?:directory|listing|search(?:\s*results)?|index)
+      | staff | coaches | contact\s*us | athletics
+      | jump\s*to.* | skip\s*to.* | filter\s*by.* | sort\s*by.* | back\s*to\s*top
+      | [A-Z0-9]\s*[-–—]\s*[A-Z0-9]      # "A-D", "0-9"
+      | [A-Z]                            # a single letter bucket
+    )$""",
+    re.I | re.X,
+)
+
+
+def _usable_group(text: str | None) -> bool:
+    """Is this label a real sport/department, or the page describing itself?"""
+    label = (text or "").strip()
+    return bool(label) and len(label) <= 80 and not _GENERIC_HEADING.match(label)
+
+
+def _is_person_block(node) -> bool:
+    """Does this node hold exactly one person's contact details?
+
+    Card layouts put the person's name in a heading, so the block above a card
+    is the *previous card* and its ``<h4>`` is a name, not a sport. Andrew
+    College's whole coaching staff came out with a colleague's name as their
+    department that way — Adam Biss filed under "Fran Balkcom".
+    """
+    if node is None or node.tag == "-text":
+        return False
+    return len(node.css('a[href^="mailto:"]')) == 1
+
+
 def _preceding_heading(node) -> str | None:
     """Nearest heading text above this node — the sport, on most layouts."""
     current = node
     for _ in range(60):
         prev = current.prev
         while prev is not None:
+            if _is_person_block(prev):
+                # Another person's card. Whatever heading it holds is their
+                # name, so don't mine it — but keep walking past it, because the
+                # real section heading sits further up.
+                prev = prev.prev
+                continue
             if prev.tag in ("h1", "h2", "h3", "h4", "h5", "caption"):
                 text = _text(prev)
-                if text:
+                if text and not _GENERIC_HEADING.match(text):
                     return text[:120]
             inner = prev.css("h1, h2, h3, h4, caption") if prev.tag != "-text" else []
             if inner:
                 text = _text(inner[-1])
-                if text:
+                if text and not _GENERIC_HEADING.match(text):
                     return text[:120]
             prev = prev.prev
         current = current.parent
@@ -625,14 +1344,28 @@ def _card_title(node, name: str) -> str | None:
     text = _text(node)
     text = text.replace(name, " ", 1)
     for line in re.split(r"\s{2,}|\|", text):
-        line = line.strip(" -–—·|")
+        line = clean_title(line.strip(" -–—·|"))
         if line and COACH_TITLE_RE.search(line) and len(line) <= 120:
             return line
     return None
 
 
+# A page title that describes the page, not the institution. bigbend.edu's
+# directory is titled "Campus Directory", and that reached the dashboard as the
+# school name for all 389 of its people.
+_NOT_A_SCHOOL_RE = re.compile(
+    r"^(?:campus|staff|faculty|employee|college|university|athletics?)?[\s&/-]*"
+    r"(?:staff|faculty|employee|campus|phone|contact|people|personnel)?[\s&/-]*"
+    r"(?:directory|listing|list|search|index|home ?page)\s*$",
+    re.I,
+)
+
+
 def _school_name(tree: HTMLParser, domain: str) -> str | None:
-    return extract.company_name(tree, domain)
+    name = extract.company_name(tree, domain)
+    if name and _NOT_A_SCHOOL_RE.match(name.strip()):
+        return None
+    return name
 
 
 def _looks_like_directory(html: str) -> bool:

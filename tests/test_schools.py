@@ -83,6 +83,178 @@ def test_ncaa_helpers():
     assert apis.ncaa_domain({}) is None
 
 
+# --- NAIA ----------------------------------------------------------------
+
+NAIA_PAGE = "\n".join([
+    "NATIONAL ASSOCIATION OF INTERCOLLEGIATE ATHLETICS  2026-2027 MEMBER INSTITUTIONS",
+    "Last Modified: 7/13/26  1",
+    "Total Schools (5)",
+    "Baker University – KS  HAAC",
+    "Bethel University – IN  Crossroads",
+    "Bethel University – TN  Mid-South",
+    # Inverted for sorting, and missing the trailing "of" as the real PDF is.
+    "Saint Francis, University – IL  CCAC",
+    # One row in the real PDF uses a plain hyphen instead of an en dash.
+    "Victoria, University of - BC CAC",
+])
+
+
+def _naia(monkeypatch, text=NAIA_PAGE):
+    """Drive parse_naia_pdf without a real PDF."""
+    class FakePage:
+        def extract_text(self):
+            return text
+
+    class FakeReader:
+        def __init__(self, *a, **k):
+            self.pages = [FakePage()]
+
+    import pypdf
+    monkeypatch.setattr(pypdf, "PdfReader", FakeReader)
+    return apis.parse_naia_pdf(b"%PDF-fake")
+
+
+def test_naia_pdf_parses_every_row(monkeypatch):
+    members = _naia(monkeypatch)
+    assert len(members) == 5
+    assert members[0]["nameOfficial"] == "Baker University"
+    assert members[0]["conferenceName"] == "Heart of America Athletic Conference"
+    assert members[0]["memberOrgAddress"]["state"] == "KS"
+    assert apis.ncaa_division(members[0]) == "NAIA"
+
+
+def test_naia_same_name_schools_are_kept_apart(monkeypatch):
+    members = _naia(monkeypatch)
+    bethels = [m for m in members if m["nameOfficial"] == "Bethel University"]
+    assert {m["memberOrgAddress"]["state"] for m in bethels} == {"IN", "TN"}
+
+
+def test_naia_inverted_names_are_restored(monkeypatch):
+    names = {m["nameOfficial"] for m in _naia(monkeypatch)}
+    assert "University of Saint Francis" in names
+    assert "University of Victoria" in names  # plain-hyphen row still parsed
+
+
+def test_naia_conference_codes_expand_to_full_names(monkeypatch):
+    confs = {m["conferenceName"] for m in _naia(monkeypatch)}
+    assert "Crossroads League" in confs
+    assert "Chicagoland Collegiate Athletic Conference" in confs
+    assert not any(len(c) <= 6 for c in confs)  # no bare codes survive
+
+
+def test_naia_count_mismatch_is_reported(monkeypatch, caplog):
+    text = NAIA_PAGE.replace("Total Schools (5)", "Total Schools (9)")
+    with caplog.at_level("WARNING"):
+        _naia(monkeypatch, text)
+    assert "but the PDF states 9" in caplog.text
+
+
+def test_division_normalization_does_not_mangle_naia():
+    """NAIA is a division value itself — prefixing it with D hid all 233."""
+    assert models.normalize_division("naia") == "NAIA"
+    assert models.normalize_division("NAIA") == "NAIA"
+    assert models.normalize_division("I") == "DI"
+    assert models.normalize_division("iii") == "DIII"
+    assert models.normalize_division("DII") == "DII"
+    assert models.normalize_division("") == ""
+
+
+def test_canadian_members_get_a_state_name_and_region():
+    assert usregions.state_name("BC") == "British Columbia"
+    assert usregions.region_for("BC") == "Canada"
+
+
+def test_same_named_naia_schools_do_not_collide_in_the_store():
+    a = School(school="Bethel University", state="Indiana", division="NAIA")
+    b = School(school="Bethel University", state="Tennessee", division="NAIA")
+    assert a.key != b.key
+
+    store_keys = {a.key, b.key}
+    assert len(store_keys) == 2
+
+
+# --- NJCAA ---------------------------------------------------------------
+
+NJCAA_PAGE = "\n".join([
+    "There are 4 Division I teams in the [[National Junior College Athletic Association]].",
+    "==Members==",
+    "===Alabama===",
+    "*[[Bevill State Community College]] Bears in [[Sumiton, Alabama|Sumiton]]",
+    "*[[Coastal Alabama Community College]] Sun Chiefs in [[Bay Minette, Alabama|Bay Minette]]",
+    "===Arkansas===",
+    # Division II/III articles write the city as plain text, not a link.
+    "*[[North Arkansas College]] Pioneers in Harrison",
+    # Piped link with an anchor: the display half is the real name.
+    "*[[University of Connecticut#Avery Point campus|UConn Avery Point]] Pointers in Groton",
+    "===External links===",
+    "* [https://www.njcaa.org/member_colleges/directory/members NJCAA members]",
+    "*Pacific Northwest Christian College Gladiators in Kennewick",
+])
+
+
+def test_njcaa_parses_both_city_formats():
+    members = apis.parse_njcaa_wikitext(NJCAA_PAGE, "NJCAA DI")
+    by_name = {m["nameOfficial"]: m for m in members}
+    assert by_name["Bevill State Community College"]["city"] == "Sumiton"
+    assert by_name["North Arkansas College"]["city"] == "Harrison"
+    assert by_name["Bevill State Community College"]["memberOrgAddress"]["state"] == "AL"
+    assert by_name["North Arkansas College"]["memberOrgAddress"]["state"] == "AR"
+
+
+def test_njcaa_piped_link_uses_the_display_name():
+    names = {m["nameOfficial"] for m in apis.parse_njcaa_wikitext(NJCAA_PAGE, "NJCAA DI")}
+    assert "UConn Avery Point" in names
+    assert not any("#" in n for n in names)
+
+
+def test_njcaa_reference_bullets_are_not_schools():
+    names = {m["nameOfficial"] for m in apis.parse_njcaa_wikitext(NJCAA_PAGE, "NJCAA DI")}
+    assert not any("njcaa.org" in n or n.startswith("http") for n in names)
+    # The unlinked entry is skipped rather than guessed at, and logged.
+    assert not any("Gladiators" in n for n in names)
+
+
+def test_njcaa_tiers_collapse_to_one_division():
+    """The NJCAA tier is per-sport, not per-college, so all three articles
+    produce a single "NJCAA" — and it can never be mistaken for an NCAA tier."""
+    members = apis.parse_njcaa_wikitext(NJCAA_PAGE, "NJCAA DI")
+    assert apis.ncaa_division(members[0]) == "NJCAA"
+    for value in ("njcaa 1", "NJCAA DI", "njcaa dii", "NJCAA DIII", "njcaa"):
+        assert models.normalize_division(value) == "NJCAA"
+    assert models.normalize_division("I") == "DI"  # still NCAA
+
+
+def test_same_name_in_naia_and_njcaa_are_different_schools():
+    """Cottey College and Marian University are in both lists — as different
+    institutions. Without the association they overwrote one another."""
+    naia = School(school="Marian University", state="Indiana", division="NAIA",
+                  association="NAIA")
+    njcaa = School(school="Marian University", state="Indiana", division="NJCAA DII",
+                   association="NJCAA")
+    assert naia.key != njcaa.key
+
+
+def test_a_college_in_two_njcaa_lists_stays_one_division():
+    """29 colleges appear in two of the three NJCAA articles because they play
+    different levels in different sports. That used to merge into
+    "NJCAA DI; NJCAA DII", which no division filter matched."""
+    d1 = School(school="Iowa Central", state="Iowa",
+                division=models.normalize_division("NJCAA DI"), association="NJCAA")
+    d2 = School(school="Iowa Central", state="Iowa",
+                division=models.normalize_division("NJCAA DII"), association="NJCAA")
+    assert d1.key == d2.key
+    assert d1.merge(d2).division == "NJCAA"
+
+
+def test_association_is_backfilled_for_records_written_before_the_field():
+    """Old rows must keep their key, not split into duplicates."""
+    assert School.from_dict({"school": "X", "division": "NAIA"}).association == "NAIA"
+    assert School.from_dict({"school": "X", "division": "NJCAA DI"}).association == "NJCAA"
+    assert School.from_dict({"school": "X", "division": "DI"}).association == "NCAA"
+    assert School.from_dict({"school": "X", "ncaa_org_id": 5}).association == "NCAA"
+    assert School.from_dict({"school": "X"}).association is None
+
+
 # --- the origin schema ---------------------------------------------------
 
 def test_to_origin_dict_is_exactly_the_origin_shape():

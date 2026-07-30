@@ -37,6 +37,8 @@ CONTACT_CSV_COLUMNS = [
     "school",
     "school_domain",
     "profile_url",
+    "photo_url",
+    "photo_file",
     "is_coach",
     "shared_email",
     "source",
@@ -52,6 +54,7 @@ SCHOOL_COLUMNS = [
     "school",
     "city",
     "state",
+    "country",
     "division",
     "conference",
     "region",
@@ -61,6 +64,86 @@ SCHOOL_COLUMNS = [
 ]
 
 ACADEMIC_KEYS = ["SATMath", "averageGPA", "ACTComposite", "SATReady"]
+
+
+@dataclass
+class SiteOutcome:
+    """What happened to one site in a run, so failures are never invisible.
+
+    A site that blocks bots and a site that simply has no staff directory both
+    yield zero people; without a reason they are indistinguishable, and a run
+    that quietly returned nothing looks like a run that found nothing.
+    """
+
+    OK: ClassVar[str] = "ok"
+    EMPTY: ClassVar[str] = "empty"
+    BLOCKED: ClassVar[str] = "blocked"
+    ROBOTS: ClassVar[str] = "robots"
+    NETWORK: ClassVar[str] = "network"
+    NO_DIRECTORY: ClassVar[str] = "no_directory"
+    ERROR: ClassVar[str] = "error"
+
+    # Everything but OK/EMPTY is worth retrying once conditions change.
+    RETRYABLE: ClassVar[frozenset[str]] = frozenset({"blocked", "network", "error"})
+
+    domain: str
+    status: str
+    detail: str = ""
+    people: int = 0
+    url: str | None = None
+    school: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status == self.OK
+
+    @property
+    def retryable(self) -> bool:
+        return self.status in self.RETRYABLE
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+# How each outcome reads in the run summary.
+OUTCOME_LABELS = {
+    SiteOutcome.OK: "scraped",
+    SiteOutcome.EMPTY: "directory found but no people parsed",
+    SiteOutcome.BLOCKED: "blocked the bot (HTTP 403/429)",
+    SiteOutcome.ROBOTS: "disallowed by robots.txt",
+    SiteOutcome.NETWORK: "network failure / timeout",
+    SiteOutcome.NO_DIRECTORY: "no staff directory found",
+    SiteOutcome.ERROR: "unhandled error",
+}
+
+
+# Associations whose name *is* the division value, because they have no tiers
+# the way NCAA I/II/III does. CCCAA (California) and NWAC (Pacific Northwest)
+# are separate governing bodies from the NJCAA, not conferences within it.
+SELF_NAMED_DIVISIONS = {"NAIA", "NJCAA", "CCCAA", "NWAC"}
+
+
+def normalize_division(value: str) -> str:
+    """Accept ``I``/``d1``/``DIII``/``naia`` and return the stored form.
+
+    The NAIA is a division value in its own right, so it must not get the
+    ``D`` prefix the NCAA tiers use.
+    """
+    token = " ".join((value or "").strip().upper().split())
+    if not token:
+        return token
+    if token in SELF_NAMED_DIVISIONS:
+        return token
+    if token == "DNAIA":  # an older run put the NCAA "D" prefix on the NAIA
+        return "NAIA"
+    if token.startswith("NJCAA"):
+        # The NJCAA tier is dropped on purpose: it is a per-sport designation,
+        # not a property of the college. A junior college routinely plays DI
+        # basketball and DII baseball, so 29 of them appeared in two of the
+        # source lists and ended up stored as "NJCAA DI; NJCAA DII" — a value
+        # no filter matched. One "NJCAA" per college is the honest shape.
+        return "NJCAA"
+    return token if token.startswith("D") else f"D{token}"
 
 
 def _utcnow() -> str:
@@ -176,6 +259,11 @@ class Contact:
     emails: list[str] = field(default_factory=list)
     phones: list[str] = field(default_factory=list)
     profile_url: str | None = None
+    photo_url: str | None = None
+    """Headshot published on the staff directory. Stored as a URL; the file is
+    only downloaded when the operator asks for it with ``--save-photos``."""
+    photo_file: str | None = None
+    """Path of the downloaded headshot, relative to the data directory."""
     is_coach: bool = False
     shared_email: bool = False
     """The listed address belongs to a gatekeeper or a shared inbox — it is on
@@ -227,7 +315,7 @@ class Contact:
     def merge(self, other: "Contact") -> "Contact":
         """Same policy as :meth:`Lead.merge` — newest scalar wins, lists union."""
         merged = Contact.from_dict(self.to_dict())
-        for name in ("name", "school", "title", "profile_url"):
+        for name in ("name", "school", "title", "profile_url", "photo_url", "photo_file"):
             new = getattr(other, name)
             if new:
                 setattr(merged, name, new)
@@ -262,6 +350,8 @@ class School:
     school: str
     city: str | None = None
     state: str | None = None
+    """US state or province."""
+    country: str | None = None
     division: str | None = None
     conference: str | None = None
     region: str | None = None
@@ -272,6 +362,10 @@ class School:
     athletics_domain: str | None = None
     website: str | None = None
     ncaa_org_id: int | None = None
+    association: str | None = None
+    """NCAA / NAIA / NJCAA. Part of the identity: Cottey College and Marian
+    University each appear in both the NAIA and NJCAA lists as different
+    institutions, and would otherwise overwrite one another."""
     source: str = "unknown"
     first_seen: str = field(default_factory=_utcnow)
     last_seen: str = field(default_factory=_utcnow)
@@ -281,7 +375,14 @@ class School:
     def key(self) -> str:
         if self.ncaa_org_id is not None:
             return f"ncaa:{self.ncaa_org_id}"
-        return re.sub(r"[^a-z0-9]+", "-", self.school.lower()).strip("-")
+        # Otherwise the name alone is not unique — there are two Bethel
+        # Universities, two Columbia Colleges and two Universities of Saint
+        # Francis, each pair in a different state. Qualify the slug with
+        # wherever the school is.
+        slug = re.sub(r"[^a-z0-9]+", "-", self.school.lower()).strip("-")
+        where = (self.state or self.country or "").lower().replace(" ", "-")
+        assoc = (self.association or "").lower()
+        return "|".join(part for part in (slug, where, assoc) if part)
 
     @property
     def label(self) -> str:
@@ -317,7 +418,12 @@ class School:
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "School":
         known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
-        return cls(**{k: v for k, v in raw.items() if k in known})
+        school = cls(**{k: v for k, v in raw.items() if k in known})
+        if not school.association:
+            # Records written before `association` existed: derive it so their
+            # key stays stable instead of splitting into a duplicate row.
+            school.association = _association_for(school)
+        return school
 
     def to_row(self) -> dict[str, str]:
         row: dict[str, str] = {}
@@ -334,13 +440,17 @@ class School:
     def merge(self, other: "School") -> "School":
         merged = School.from_dict(self.to_dict())
         for name in (
-            "school", "city", "state", "division", "conference", "region",
+            "school", "city", "state", "country", "conference", "region",
             "totalYearlyCost", "privatePublic", "athletics_domain", "website",
-            "ncaa_org_id",
+            "ncaa_org_id", "association",
         ):
             new = getattr(other, name)
             if new:
                 setattr(merged, name, new)
+        # An NJCAA college can play at different division levels in different
+        # sports, so it appears in more than one division list. Keep both
+        # rather than letting the last one win.
+        merged.division = _join_unique(merged.division, other.division)
         # Never let a newer empty lookup blank out an academic value we already
         # hold — test-optional years return nulls for schools that once reported.
         merged.academicData = {
@@ -352,6 +462,20 @@ class School:
         merged.first_seen = min(merged.first_seen, other.first_seen)
         merged.last_seen = max(merged.last_seen, other.last_seen)
         return merged
+
+
+def _association_for(school: "School") -> str | None:
+    """Infer the association from a record that predates the field."""
+    if school.ncaa_org_id is not None:
+        return "NCAA"
+    division = (school.division or "").upper()
+    if division.startswith("NJCAA"):
+        return "NJCAA"
+    if division in SELF_NAMED_DIVISIONS:
+        return division
+    if division:
+        return "NCAA"
+    return None  # non-athletic record, e.g. an academic-only institution
 
 
 def _join_unique(a: str | None, b: str | None) -> str | None:

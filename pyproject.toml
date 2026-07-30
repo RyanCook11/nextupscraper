@@ -9,6 +9,10 @@ dependencies = [
     "playwright>=1.44",
     "fastapi>=0.111",
     "uvicorn[standard]>=0.30",
+    # The NAIA publishes its member institutions only as a PDF.
+    "pypdf>=4.0",
+    # Reading hand-maintained school lists supplied as spreadsheets.
+    "openpyxl>=3.1",
 ]
 
 [project.optional-dependencies]

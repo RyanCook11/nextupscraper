@@ -23,6 +23,11 @@ STATE_NAMES = {
     "UT": "Utah", "VT": "Vermont", "VA": "Virginia", "WA": "Washington",
     "WV": "West Virginia", "WI": "Wisconsin", "WY": "Wyoming",
     "PR": "Puerto Rico", "VI": "U.S. Virgin Islands", "GU": "Guam",
+    # NAIA membership reaches into Canada.
+    "AB": "Alberta", "BC": "British Columbia", "MB": "Manitoba",
+    "NB": "New Brunswick", "NL": "Newfoundland and Labrador", "NS": "Nova Scotia",
+    "ON": "Ontario", "PE": "Prince Edward Island", "QC": "Quebec",
+    "SK": "Saskatchewan",
 }
 
 _DIVISIONS = {
@@ -37,6 +42,7 @@ _DIVISIONS = {
     "West (Pacific)": ("AK", "CA", "HI", "OR", "WA"),
     # Not Census regions, but the schema needs something for them.
     "Territories": ("PR", "VI", "GU"),
+    "Canada": ("AB", "BC", "MB", "NB", "NL", "NS", "ON", "PE", "QC", "SK"),
 }
 
 REGION_BY_STATE = {

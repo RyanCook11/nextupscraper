@@ -59,13 +59,14 @@ class WebsiteSource(Source):
             if str(seeds_path) == "-":
                 raw.extend(sys.stdin.read().splitlines())
             elif seeds_path.exists():
-                raw.extend(seeds_path.read_text(encoding="utf-8").splitlines())
+                # utf-8-sig strips the BOM Notepad/PowerShell leave behind.
+                raw.extend(seeds_path.read_text(encoding="utf-8-sig").splitlines())
             else:
                 raise SystemExit(f"seed file not found: {seeds_path}")
 
         seen: dict[str, None] = {}
         for line in raw:
-            line = line.split("#", 1)[0].strip()
+            line = line.split("#", 1)[0].strip().lstrip("﻿").strip()
             if not line:
                 continue
             domain = normalize_domain(line)

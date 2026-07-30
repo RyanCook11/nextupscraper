@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .config import Settings
-from .models import CSV_COLUMNS, Contact, Lead, School
+from .models import CSV_COLUMNS, Contact, Lead, School, SiteOutcome
 
 log = logging.getLogger("scrapbot.storage")
 
@@ -162,7 +162,13 @@ class SchoolStore(RecordStore):
 _STEMS = {Contact: "contacts", School: "schools"}
 
 
-def save_run(settings: Settings, rid: str, leads: list[Record], meta: dict) -> Path:
+def save_run(
+    settings: Settings,
+    rid: str,
+    leads: list[Record],
+    meta: dict,
+    outcomes: list[SiteOutcome] | None = None,
+) -> Path:
     """Write an immutable snapshot of just this run."""
     out_dir = settings.runs_dir / rid
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -170,4 +176,40 @@ def save_run(settings: Settings, rid: str, leads: list[Record], meta: dict) -> P
     write_json(out_dir / f"{stem}.json", [lead.to_dict() for lead in leads])
     write_csv(out_dir / f"{stem}.csv", leads)
     write_json(out_dir / "meta.json", meta)
+    if outcomes:
+        write_outcomes(out_dir, outcomes)
     return out_dir
+
+
+def write_outcomes(out_dir: Path, outcomes: list[SiteOutcome]) -> None:
+    """Per-site results: the full report, plus a ready-to-use retry seed file.
+
+    ``failed.txt`` is written in seed-file format on purpose, so a failed run
+    can be retried with ``scrapbot run coaches --seeds <run>/failed.txt``.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_json(out_dir / "sites.json", [o.to_dict() for o in outcomes])
+
+    succeeded = [o for o in outcomes if o.ok]
+    failed = [o for o in outcomes if not o.ok]
+
+    _write_atomic(
+        out_dir / "succeeded.txt",
+        "\n".join(
+            ["# Sites scraped successfully in this run.", ""]
+            + [f"{o.domain}  # {o.people} people" for o in succeeded]
+        )
+        + "\n",
+    )
+    _write_atomic(
+        out_dir / "failed.txt",
+        "\n".join(
+            [
+                "# Sites that produced nothing, and why.",
+                "# Retry with: scrapbot run coaches --seeds this-file",
+                "",
+            ]
+            + [f"{o.domain}  # {o.status}: {o.detail}" for o in failed]
+        )
+        + "\n",
+    )

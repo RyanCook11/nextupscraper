@@ -120,6 +120,34 @@ STAFF_DIRECTORY = """<!doctype html>
 </body></html>
 """
 
+# One long table whose sections are single-cell rows rather than separate
+# tables per sport. Kentucky's directory is built this way.
+STAFF_SECTIONED = """<!doctype html>
+<html><head><title>Staff Directory | Wildcat Athletics</title></head><body>
+  <h1>Staff Directory</h1>
+  <table>
+    <thead><tr><th>Name</th><th>Title</th><th>Phone</th><th>Email</th></tr></thead>
+    <tbody>
+      <tr><td>Administration</td></tr>
+      <tr><td><a href="/staff-directory/dale-nash/1">Dale Nash</a></td>
+          <td>Athletics Director</td><td>(555) 333-0001</td>
+          <td><a href="mailto:dale.nash@wildcat.edu">dale.nash@wildcat.edu</a></td></tr>
+      <tr><td>Football</td></tr>
+      <tr><td><a href="/staff-directory/rob-vance/2">Rob Vance</a></td>
+          <td>Head Coach</td><td>(555) 333-0002</td>
+          <td><a href="mailto:football@wildcat.edu">football@wildcat.edu</a></td></tr>
+      <tr><td><a href="/staff-directory/kim-doyle/3">Kim Doyle</a></td>
+          <td>Offensive Coordinator</td><td></td>
+          <td><a href="mailto:football@wildcat.edu">football@wildcat.edu</a></td></tr>
+      <tr><td>Volleyball</td></tr>
+      <tr><td><a href="/staff-directory/ana-reyes/4">Ana Reyes</a></td>
+          <td>Head Coach</td><td></td>
+          <td><a href="mailto:ana.reyes@wildcat.edu">ana.reyes@wildcat.edu</a></td></tr>
+    </tbody>
+  </table>
+</body></html>
+"""
+
 # Card layout, for sites that don't use tables at all.
 STAFF_CARDS = """<!doctype html>
 <html><head><title>Coaches | Cardinal Athletics</title></head><body>
@@ -149,8 +177,85 @@ MALFORMED = """<!doctype html>
 </body></html>
 """
 
+# A university's general faculty/staff page: the shape that fooled the bot on
+# aquinas.edu. No sport column, mostly professors, a couple of coaches buried in
+# it. "Department" is deliberately a trailing unknown column — that combination
+# used to map a named column to a negative cell index and raise IndexError.
+FACULTY_DIRECTORY = """<!doctype html>
+<html><head><title>Faculty &amp; Staff | Aquinas</title></head><body>
+  <h1>Faculty &amp; Staff Directory</h1>
+  <table>
+    <tr><th>Name</th><th>Title</th><th>Department</th><th>Email</th></tr>
+    <tr><td>Alan Reed</td><td>Professor of Biology</td><td>Biology</td>
+        <td>alan.reed@aq.edu</td></tr>
+    <tr><td>Bea Lowe</td><td>Registrar</td><td>Records</td>
+        <td>bea.lowe@aq.edu</td></tr>
+    <tr><td>Cal Ives</td><td>Associate Professor of History</td><td>History</td>
+        <td>cal.ives@aq.edu</td></tr>
+    <tr><td>Dana Poe</td><td>Director of Financial Aid</td><td>Financial Aid</td>
+        <td>dana.poe@aq.edu</td></tr>
+    <tr><td>Eve Marsh</td><td>Head Coach</td><td>Athletics</td>
+        <td>eve.marsh@aq.edu</td></tr>
+    <tr><td>Finn Doyle</td><td>Assistant Coach</td><td>Athletics</td></tr>
+    <tr><td>Gus Hale</td><td>Librarian</td><td>Library</td>
+        <td>gus.hale@aq.edu</td></tr>
+    <tr><td>Hana Vue</td><td>Professor of Chemistry</td><td>Chemistry</td>
+        <td>hana.vue@aq.edu</td></tr>
+  </table>
+</body></html>
+"""
+
+# The Sidearm layout, as served by aqsaints.com. Three things here broke the
+# parser at once: sections marked with a one-cell <th> (which table.css("th")
+# swept into the header list), a headerless-looking image column that must NOT
+# shift the mapping, and emails assembled by a per-row <script>.
+SIDEARM_DIRECTORY = """<!doctype html>
+<html><head><title>Staff Directory - Aquinas College</title></head><body>
+  <h1>Staff Directory</h1>
+  <table>
+    <thead>
+      <tr><th>Image</th><th>Name</th><th>Title</th><th>Email Address</th><th>Phone</th></tr>
+    </thead>
+    <tbody>
+      <tr><th>Adminstration</th></tr>
+      <tr>
+        <td><img src="/images/2025/8/25/Damon_Bouwkamp_headshot.jpeg" alt="Damon Bouwkamp"></td>
+        <td>Damon Bouwkamp</td><td>Director of Intercollegiate Athletics (AD)</td>
+        <td><a id="staff_email_0" href="#"></a>
+          <script type="text/javascript">
+            var placeholder = document.getElementById("staff_email_0");
+            var firstHalf = "bouwkdam";
+            var secondHalf = "aquinas.edu";
+            placeholder.href = 'mailto:' + firstHalf + '@' + secondHalf;
+          </script></td>
+        <td></td>
+      </tr>
+      <tr><th>Men's Basketball</th></tr>
+      <tr>
+        <td><img src="/images/2024/9/12/Ryan_Bertoia.jpg" alt="Ryan Bertoia"></td>
+        <td>Ryan Bertoia</td><td>Head Coach</td>
+        <td><a id="staff_email_1" href="#"></a>
+          <script type="text/javascript">
+            var placeholder = document.getElementById("staff_email_1");
+            var firstHalf = "rmb004";
+            var secondHalf = "aquinas.edu";
+            placeholder.href = 'mailto:' + firstHalf + '@' + secondHalf;
+          </script></td>
+        <td>(616) 632-2478</td>
+      </tr>
+      <tr>
+        <td><img src="/images/placeholder-silhouette.png" alt="No photo available"></td>
+        <td>Dana Poe</td><td>Assistant Coach</td><td></td><td></td>
+      </tr>
+    </tbody>
+  </table>
+</body></html>
+"""
+
 PAGES = {
     "/": HOME,
+    "/faculty-staff": FACULTY_DIRECTORY,
+    "/sidearm": SIDEARM_DIRECTORY,
     "/contact-us": CONTACT,
     "/careers": CAREERS,
     "/about": ABOUT,
@@ -162,6 +267,10 @@ PAGES = {
 
 ROBOTS = "User-agent: *\nDisallow: /admin\n"
 
+# Smallest thing that is genuinely a JPEG: SOI, a comment segment, EOI. Enough
+# for the download path, which checks the content type rather than the bytes.
+FAKE_JPEG = b"\xff\xd8\xff\xfe\x00\x10headshot fixture\xff\xd9"
+
 
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -171,11 +280,21 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/robots.txt":
             self._send(ROBOTS, "text/plain; charset=utf-8")
             return
+        if path.startswith("/images/"):
+            self._send_bytes(FAKE_JPEG, "image/jpeg")
+            return
         body = PAGES.get(path)
         if body is None:
             self._send("<h1>404</h1>", "text/html; charset=utf-8", status=404)
             return
         self._send(body, "text/html; charset=utf-8")
+
+    def _send_bytes(self, raw: bytes, ctype: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
     def _send(self, body: str, ctype: str, status: int = 200) -> None:
         raw = body.encode("utf-8")
@@ -209,3 +328,26 @@ class FixtureSite:
             self._server.server_close()
         if self._thread is not None:
             self._thread.join(timeout=5)
+
+
+# Bay College: an <h2> per sport with its own table underneath — the layout the
+# campus-directory salvage was hiding, because the athletics host was never read.
+HEADING_PER_SPORT = """<!doctype html>
+<html><head><title>Staff Directory - Bay College Norse</title></head><body>
+  <h1>Staff Directory</h1>
+  <h2>Administration</h2>
+  <table><tr><th>Name</th><th>Title</th><th>Phone</th><th>E-Mail</th></tr>
+    <tr><td>Matt Johnson</td><td>Director of Athletics</td><td>906-217-4134</td>
+        <td><a href="mailto:matt.c.johnson@baycollege.edu">matt.c.johnson@baycollege.edu</a></td></tr>
+  </table>
+  <h2>Baseball</h2>
+  <table><tr><th>Name</th><th>Title</th><th>Phone</th><th>E-Mail</th></tr>
+    <tr><td>Travis Derrick</td><td>Assistant Baseball Coach</td><td></td><td></td></tr>
+  </table>
+  <h2>Women's Basketball</h2>
+  <table><tr><th>Name</th><th>Title</th><th>Phone</th><th>E-Mail</th></tr>
+    <tr><td>James Fassett</td><td>Head Women's Basketball Coach</td><td>906-217-4285</td>
+        <td><a href="mailto:james.fassett@baycollege.edu">james.fassett@baycollege.edu</a></td></tr>
+  </table>
+</body></html>
+"""

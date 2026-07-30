@@ -20,16 +20,36 @@ log = logging.getLogger("scrapbot.net")
 JS_TEXT_THRESHOLD = 600
 
 
+# Sentinel statuses for failures that aren't an HTTP response.
+ROBOTS_BLOCKED = 999
+NETWORK_FAILED = 0
+
+
 @dataclass
 class Page:
     url: str
     status: int
     html: str
     rendered: bool = False
+    error: str = ""
+    """Why a non-HTTP failure happened, for the run report."""
 
     @property
     def ok(self) -> bool:
         return 200 <= self.status < 300 and bool(self.html)
+
+    @property
+    def blocked(self) -> bool:
+        """The server refused an automated client rather than failing."""
+        return self.status in (401, 403, 405, 406, 429) or self.status == 451
+
+    @property
+    def robots_blocked(self) -> bool:
+        return self.status == ROBOTS_BLOCKED
+
+    @property
+    def network_failed(self) -> bool:
+        return self.status == NETWORK_FAILED
 
 
 class RobotsCache:
@@ -145,7 +165,9 @@ class Fetcher:
         if self.settings.respect_robots and not await self._robots.allowed(url):
             self.stats["blocked"] += 1
             log.info("robots.txt disallows %s — skipping", url)
-            return Page(url=url, status=999, html="")
+            return Page(
+                url=url, status=ROBOTS_BLOCKED, html="", error="robots.txt disallow"
+            )
 
         delay = self.settings.delay
         robots_delay = await self._robots.crawl_delay(url)
@@ -170,6 +192,36 @@ class Fetcher:
                 return rendered
         return page
 
+    async def get_bytes(self, url: str, max_bytes: int = 2_000_000) -> bytes | None:
+        """Fetch a binary asset (a headshot) under the same rules as a page.
+
+        Same robots check and same per-host delay as :meth:`get` — an image is
+        still a request to someone's server. No retries and no browser: a
+        missing photo is not worth a second round trip.
+        """
+        assert self._client is not None and self._robots is not None, "use as async context manager"
+        if self.settings.respect_robots and not await self._robots.allowed(url):
+            self.stats["blocked"] += 1
+            return None
+
+        host = urlparse(url).netloc
+        delay = max(self.settings.delay, await self._robots.crawl_delay(url) or 0)
+        await self._throttle(host, delay)
+        try:
+            self.stats["requests"] += 1
+            resp = await self._client.get(url)
+        except httpx.HTTPError as exc:
+            log.debug("photo %s failed: %s", url, exc)
+            self.stats["errors"] += 1
+            return None
+
+        if resp.status_code != 200:
+            return None
+        if not resp.headers.get("content-type", "").startswith("image/"):
+            return None
+        data = resp.content
+        return data[:max_bytes] if data else None
+
     async def _get_static(self, url: str, host: str, delay: float) -> Page:
         assert self._client is not None
         last_error: Exception | None = None
@@ -180,6 +232,12 @@ class Fetcher:
                 resp = await self._client.get(url)
             except httpx.HTTPError as exc:
                 last_error = exc
+                if _is_permanent(exc):
+                    # A name that doesn't resolve won't resolve on retry, and a
+                    # seed list of a few hundred schools usually holds a few
+                    # dead domains. Backing off on those wastes minutes.
+                    log.debug("%s failed permanently: %s", url, exc)
+                    break
                 await asyncio.sleep(min(2**attempt, 8))
                 continue
 
@@ -198,7 +256,12 @@ class Fetcher:
 
         self.stats["errors"] += 1
         log.info("giving up on %s: %s", url, last_error)
-        return Page(url=url, status=0, html="")
+        return Page(
+            url=url,
+            status=NETWORK_FAILED,
+            html="",
+            error=f"{type(last_error).__name__}: {last_error}" if last_error else "no response",
+        )
 
     async def _ensure_browser(self):
         async with self._browser_lock:
@@ -219,7 +282,9 @@ class Fetcher:
                 "browser rendering unavailable (%s). Run: playwright install chromium", exc
             )
             self.settings.render = "never"
-            return Page(url=url, status=0, html="")
+            return Page(
+                url=url, status=NETWORK_FAILED, html="", error=f"browser unavailable: {exc}"
+            )
 
         context = await browser.new_context(
             user_agent=self.settings.user_agent,
@@ -246,9 +311,30 @@ class Fetcher:
         except Exception as exc:
             self.stats["errors"] += 1
             log.info("render failed for %s: %s", url, exc)
-            return Page(url=url, status=0, html="")
+            return Page(
+                url=url, status=NETWORK_FAILED, html="",
+                error=f"render failed: {type(exc).__name__}: {exc}",
+            )
         finally:
             await context.close()
+
+
+# DNS answers don't change between two attempts a second apart.
+_PERMANENT_ERRORS = (
+    "getaddrinfo failed",
+    "name or service not known",
+    "nodename nor servname",
+    "temporary failure in name resolution",
+    "no address associated with hostname",
+)
+
+
+def _is_permanent(exc: Exception) -> bool:
+    """True when retrying this failure cannot plausibly help."""
+    if not isinstance(exc, httpx.ConnectError):
+        return False
+    message = str(exc).lower()
+    return any(marker in message for marker in _PERMANENT_ERRORS)
 
 
 def _visible_text_length(html: str) -> int:
