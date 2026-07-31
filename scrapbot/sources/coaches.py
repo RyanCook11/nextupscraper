@@ -200,7 +200,6 @@ NOT_COACH_TITLE_RE = re.compile(
     r"\bassistant to\b|\bsecretary\b|\bcoordinator of coaching\b", re.I
 )
 
-
 def is_coaching_title(title: str | None) -> bool:
     text = title or ""
     return bool(COACH_TITLE_RE.search(text)) and not NOT_COACH_TITLE_RE.search(text)
@@ -222,6 +221,19 @@ _TITLE_LABEL_RE = re.compile(
     r"cell|mobile|fax|contact)\s*[:.]\s*", re.I
 )
 
+# The same labels again, but as the *anchor text* of a card's action links
+# rather than a "Label: value" pair — "Phone", "Email", "Full Bio for Jordan
+# Lauf". They sit at the end of the run-together card text, so a coach's title
+# read "Assistant Men's Basketball Coach Phone Full Bio for Jordan Lauf".
+#
+# Anchored to the end and applied repeatedly, so only trailing labels go: a job
+# title that genuinely contains one of these words keeps it.
+_TITLE_TRAILING_LABEL_RE = re.compile(
+    r"[\s\-–—·|,]*\b(?:full\s+bio(?:\s+for\b.*)?|bio|e-?mail(?:\s+\S+@\S+)?|"
+    r"phone|telephone|tel|profile|twitter|instagram|facebook)\s*$",
+    re.I,
+)
+
 
 def clean_title(text: str | None) -> str | None:
     """Strip the contact details a directory crams into the title cell.
@@ -237,6 +249,9 @@ def clean_title(text: str | None) -> str | None:
     cleaned = extract.PHONE_RE.sub(" ", cleaned)
     cleaned = _TITLE_LABEL_RE.sub(" ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t-–—·|,;:/")
+    # Cards run several action links together, so more than one can trail.
+    while (trimmed := _TITLE_TRAILING_LABEL_RE.sub("", cleaned).strip(" \t-–—·|,;:/")) != cleaned:
+        cleaned = trimmed
 
     # Drop a leading section banner only when a job title is left without it.
     # "Athletics Director" keeps its first word; "ATHLETICS Head Coach" does not
@@ -248,6 +263,38 @@ def clean_title(text: str | None) -> str | None:
 
 # Row-level noise: a directory row that is really a heading or a spacer.
 SKIP_NAME_RE = re.compile(r"^(?:name|staff|full name|\s*)$", re.I)
+
+# What a directory puts in the name field when the post is vacant. These are
+# honest entries — the page really does say "TBA" — but they are job openings,
+# not people, and a contact store full of them is a store of nothing to contact.
+# The address on such a row is a department inbox, which _flag_shared_emails
+# already handles wherever a real person also lists it.
+PLACEHOLDER_NAMES = frozenset(
+    {
+        "tba", "tbd", "tbn", "t ba", "t bd", "t b a", "t b d",
+        "to be announced", "to be determined", "to be named",
+        "to be hired", "to be filled", "to be confirmed",
+        "vacant", "vacancy", "open", "open position", "position open",
+        "staff tbd", "staff tba", "none", "unknown", "no name", "n a", "na",
+    }
+)
+
+
+def is_placeholder_name(raw: str) -> bool:
+    """Is this a vacancy marker rather than somebody's name?
+
+    Directories spell it a dozen ways — "TBA", "T BA", ". TBD", "TBA ,",
+    "- Vacant -", "TBD TBD". Punctuation is stripped and a doubled token
+    ("TBA TBA", from a first-name/last-name pair that are both placeholders)
+    collapses to one, so all of them land on the same handful of words.
+    """
+    token = " ".join(re.sub(r"[^a-z]+", " ", (raw or "").lower()).split())
+    if not token:
+        return True
+    words = token.split()
+    if len(words) > 1 and len(set(words)) == 1:
+        token = words[0]  # "TBA TBA" is one placeholder, not two names
+    return token in PLACEHOLDER_NAMES
 
 # Anchor text on a university homepage that points at the athletics site.
 ATHLETICS_LINK_RE = re.compile(r"\bathletics\b|\bvarsity sports\b|\bgo\s+\w+s\b", re.I)
@@ -261,6 +308,7 @@ class CoachesSource(Source):
     def __init__(self, settings, args) -> None:
         super().__init__(settings, args)
         self._host_map: dict[str, str] | None = None
+        self._name_map: dict[str, str] | None = None
         # Hosts already given one browser attempt after the static HTML parsed
         # to nobody, so a site that needs a browser costs one render, not one
         # per candidate path we try on it.
@@ -399,7 +447,7 @@ class CoachesSource(Source):
         html = path.read_text(encoding="utf-8", errors="replace")
         base_url = f"https://{domain}/"
         tree = extract.parse(html)
-        school = _school_name(tree, domain)
+        school = self._school_name_map().get(domain) or _school_name(tree, domain)
         contacts = parse_directory(tree, base_url, domain, school, self.name)
         _flag_shared_emails(contacts)
 
@@ -506,6 +554,31 @@ class CoachesSource(Source):
                 if site and school.athletics_domain and site != school.athletics_domain:
                     self._host_map[site] = school.athletics_domain
         return self._host_map
+
+    def _school_name_map(self) -> dict[str, str]:
+        """``ahcbulldogs.com -> "Allan Hancock College"``, from the school store.
+
+        The page title is a poor source for an institution's name. It is
+        marketing — "The Official Home of Allan Hancock College Athletics" — and
+        on a campus directory it is often not a name at all, which is why ten
+        hosts stored 192 people with no school against them. The school store
+        holds the official name from the NCAA, NAIA or NJCAA directory, keyed by
+        the very host being scraped, so prefer it and fall back to the title
+        only for hosts it does not know.
+        """
+        if self._name_map is None:
+            self._name_map = {}
+            try:
+                schools = storage.SchoolStore(self.settings).load().sorted_leads()
+            except Exception:  # a missing/unreadable store is not fatal here
+                return self._name_map
+            for school in schools:
+                if not school.school:
+                    continue
+                for host in (school.athletics_domain, normalize_domain(school.website or "")):
+                    if host:
+                        self._name_map.setdefault(host, school.school)
+        return self._name_map
 
     def _university_host_map(self) -> dict[str, str]:
         """``wranglersports.net -> cisco.edu`` — the map read backwards.
@@ -661,7 +734,7 @@ class CoachesSource(Source):
         if not _looks_like_directory(page.html):
             return None
         tree = extract.parse(page.html)
-        school = _school_name(tree, domain)
+        school = self._school_name_map().get(domain) or _school_name(tree, domain)
         contacts = parse_directory(tree, page.url, domain, school, self.name)
         if not contacts:
             return None
@@ -758,13 +831,16 @@ class CoachesSource(Source):
         if not slugs:
             return None
 
-        budget = max(0, self.settings.max_pages_per_site - len(seen))
+        # Charged against its own allowance, not the site budget: a site laid
+        # out this way has no combined directory to find, so the sport pages
+        # are not extra crawling — they *are* the directory.
+        budget = max(0, self.settings.max_sport_pages - len(seen))
         if budget <= 0:
             return None
         if len(slugs) > budget:
             log.info(
                 "%s: %d sports but only %d request(s) of budget left; "
-                "raise --max-pages to cover them all",
+                "raise --max-sport-pages to cover them all",
                 domain, len(slugs), budget,
             )
             slugs = slugs[:budget]
@@ -773,14 +849,17 @@ class CoachesSource(Source):
         school: str | None = None
         first: Page | None = None
         for slug in slugs:
-            page = await fetcher.get(f"{base}/sports/{slug}/coaches")
+            # "/coaches" answers a redirect to "/coaches/index"; asking for the
+            # canonical URL saves a request per sport, and on a challenged host
+            # every avoided request is one less chance to be handed a captcha.
+            page = await fetcher.get(f"{base}/sports/{slug}/coaches/index")
             seen.append(page)
             if not page.ok or not _looks_like_directory(
                 page.html, MIN_SPORT_PAGE_SIGNALS
             ):
                 continue
             tree = extract.parse(page.html)
-            school = school or _school_name(tree, domain)
+            school = school or self._school_name_map().get(domain) or _school_name(tree, domain)
             found = parse_directory(tree, page.url, domain, school, self.name)
             if found:
                 first = first or page
@@ -1027,7 +1106,7 @@ def _row_to_contact(
     }
 
     name = values.get("name", "")
-    if not name or SKIP_NAME_RE.match(name):
+    if not name or SKIP_NAME_RE.match(name) or is_placeholder_name(name):
         return None
 
     contact = _make(name, group, domain, school, source)
@@ -1088,13 +1167,16 @@ def _parse_person_cards(
     for node in cards:
         # A card can still nest inside an outer wrapper the same selector
         # matches; keep the outermost so a person isn't emitted twice.
-        if any(id(ancestor) in seen_nodes for ancestor in _ancestors(node)):
+        # mem_id, not id(): selectolax returns a fresh Python wrapper on every
+        # access, so id(node.parent) never matches the id() recorded for that
+        # same element and the check silently never fires.
+        if any(ancestor.mem_id in seen_nodes for ancestor in _ancestors(node)):
             continue
-        seen_nodes.add(id(node))
+        seen_nodes.add(node.mem_id)
 
         name_node = node.css_first(_CARD_NAME)
         name = name_node.text(strip=True) if name_node else None
-        if not name:
+        if not name or is_placeholder_name(name):
             continue
 
         contact = _make(name, _preceding_heading(node), domain, school, source)
@@ -1134,16 +1216,24 @@ def _parse_cards(
         # looking at a container of several people, not one person.
         if len(mailto) != 1:
             continue
-        if any(id(ancestor) in seen_nodes for ancestor in _ancestors(node)):
+        # mem_id, not id(). selectolax hands out a fresh Python wrapper on every
+        # access, so id(node.parent) never equals the id() recorded for that
+        # same element earlier and the check silently never fired. Every nested
+        # wrapper inside a card then parsed as its own person: on the modern
+        # Sidearm layout the innermost one is the contact block, whose first
+        # <a> is the tel: link, so a coach's name came out as their phone
+        # number ("419-530-4796" for Jordan Lauf at utrockets.com). mem_id is
+        # the underlying node address and is stable across accesses.
+        if any(ancestor.mem_id in seen_nodes for ancestor in _ancestors(node)):
             continue
-        seen_nodes.add(id(node))
+        seen_nodes.add(node.mem_id)
 
         addr = (mailto[0].attributes.get("href") or "")[len("mailto:"):].split("?")[0].lower()
         if not _email_ok(addr):
             continue
 
         name = _card_name(node)
-        if not name:
+        if not name or is_placeholder_name(name):
             continue
         contact = _make(name, _preceding_heading(node), domain, school, source)
         _add_email(contact, addr)
@@ -1328,6 +1418,27 @@ _NAME_SUFFIX_RE = re.compile(
 )
 
 
+# A jersey number in front of the name, and an alumni class year after it.
+# Division III directories are full of both: "#42 Matthew Owens '18" is one
+# person, and neither decoration belongs in the name field — searching for
+# "Matthew Owens" has to find him, and two records of the same coach must not
+# differ only by the year they graduated.
+#
+# The year is required to be exactly two digits behind an apostrophe at the very
+# end, so "O'Melia" and "D'Angelo" keep theirs.
+_NAME_JERSEY_RE = re.compile(r"^#\s*\d{1,3}\s+")
+_NAME_CLASS_YEAR_RE = re.compile(r"\s*['‘’ʼ]\s*\d{2}\s*$")
+
+
+def strip_name_decorations(name: str) -> str:
+    """Drop a leading jersey number and a trailing class year."""
+    cleaned = _NAME_JERSEY_RE.sub("", name)
+    # "'19 '23" would need two passes; run until it settles.
+    while (trimmed := _NAME_CLASS_YEAR_RE.sub("", cleaned)) != cleaned:
+        cleaned = trimmed
+    return cleaned.strip() or name
+
+
 def normalize_person_name(raw: str) -> str:
     """``"Baker, Alycia"`` -> ``"Alycia Baker"``.
 
@@ -1337,8 +1448,11 @@ def normalize_person_name(raw: str) -> str:
 
     Only a single comma with real words either side is flipped, so "Smith, Jr."
     and "Lee, PhD" are left exactly as they are.
+
+    Jersey numbers and class years are stripped first, so the comma test below
+    sees the name itself.
     """
-    name = " ".join((raw or "").split())
+    name = strip_name_decorations(" ".join((raw or "").split()))
     if name.count(",") != 1:
         return name
     surname, rest = (part.strip() for part in name.split(","))
@@ -1591,11 +1705,65 @@ _NOT_A_SCHOOL_RE = re.compile(
 )
 
 
+# Boilerplate an athletics site wraps around its own name in the page title.
+# "The Official Home of Allan Hancock College Athletics" is the institution
+# plus marketing; only the institution belongs in a school field.
+_SCHOOL_TITLE_PREFIX_RE = re.compile(
+    r"^(?:the\s+)?official\s+(?:home|website|athletics?\s+(?:website|site))\s+of\s+", re.I
+)
+_SCHOOL_TITLE_SEGMENT_RE = re.compile(
+    r"^(?:the\s+)?official\s+(?:athletics?|athletic)\s+(?:website|site|home)"
+    r"|^official\s+home$|^athletic\s+programs$",
+    re.I,
+)
+# Only stripped when a recognisable institution is left behind, so "Duke
+# Athletics" loses the suffix and a club called "Athletics" would not.
+_SCHOOL_KIND_RE = re.compile(
+    r"\b(?:college|university|universität|institute|academy|school|seminary|"
+    r"polytechnic|conservatory)\b",
+    re.I,
+)
+
+
+def clean_school_name(raw: str | None) -> str | None:
+    """Strip the marketing an athletics site wraps around its own name.
+
+    A fallback only. The school store holds the official name from the NCAA,
+    NAIA or NJCAA directory and is preferred wherever the host is on record —
+    see :meth:`CoachesSource._school_name_map`. This is for the handful of
+    hosts that are not.
+
+    Deliberately conservative: it removes phrases that are unambiguously
+    boilerplate and leaves everything else. Plenty of genuinely long names are
+    correct — "The Community College of Baltimore County - Catonsville Campus",
+    "Richard Bland College of the College of William and Mary" — and truncating
+    on length would corrupt them.
+    """
+    if not raw:
+        return None
+    name = " ".join(raw.split())
+    name = _SCHOOL_TITLE_PREFIX_RE.sub("", name)
+
+    # "SJSU Athletics | Official Athletics Site | Spartans" — drop the segments
+    # that say nothing, keep the rest in the order the site wrote them.
+    parts = [p.strip() for p in re.split(r"\s+[|–—-]\s+", name)]
+    kept = [p for p in parts if p and not _SCHOOL_TITLE_SEGMENT_RE.match(p)]
+    if kept:
+        name = " - ".join(kept)
+
+    # A trailing "Athletics" is the department, not the institution — but only
+    # drop it when what remains still names one.
+    trimmed = re.sub(r"\s+athletics?$", "", name, flags=re.I)
+    if trimmed != name and _SCHOOL_KIND_RE.search(trimmed):
+        name = trimmed
+    return name.strip(" -|") or None
+
+
 def _school_name(tree: HTMLParser, domain: str) -> str | None:
     name = extract.company_name(tree, domain)
     if name and _NOT_A_SCHOOL_RE.match(name.strip()):
         return None
-    return name
+    return clean_school_name(name)
 
 
 # A Sidearm card directory links each person at /staff-directory/<slug>/<id>.

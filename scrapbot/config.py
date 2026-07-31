@@ -91,6 +91,16 @@ class Settings:
     # --- crawl shape ------------------------------------------------------
     max_pages_per_site: int = field(default_factory=lambda: _env_int("MAX_PAGES_PER_SITE", 6))
     max_bytes_per_page: int = field(default_factory=lambda: _env_int("MAX_BYTES_PER_PAGE", 3_000_000))
+    max_sport_pages: int = field(default_factory=lambda: _env_int("MAX_SPORT_PAGES", 40))
+    """Budget for the one-page-per-sport layout, separate from the site budget.
+
+    PrestoSports publishes no combined staff directory at all: the coaches live
+    at ``/sports/<sport>/coaches/index``, one page per team, and a college
+    fields 15-25 teams. Charged against ``max_pages_per_site`` (6) that layout
+    can only ever be read a quarter of the way through, so it gets its own
+    allowance. These are cheap, targeted fetches — one page per team, no
+    crawling — and the per-host delay still paces them.
+    """
 
     # --- rendering --------------------------------------------------------
     render: str = field(default_factory=lambda: _env_str("RENDER", "auto"))
@@ -100,6 +110,22 @@ class Settings:
     # --- human-mimicry timing ---------------------------------------------
     jitter_min: float = field(default_factory=lambda: _env_float("JITTER_MIN", 0.2))
     jitter_max: float = field(default_factory=lambda: _env_float("JITTER_MAX", 0.8))
+
+    # --- caching ----------------------------------------------------------
+    cache_ttl: float = field(default_factory=lambda: _env_float("CACHE_TTL", 604_800.0))
+    """How long a fetched page stays reusable, in seconds; 0 disables the cache.
+
+    The default is a week. Coaching directories turn over on the scale of a
+    season, and not re-fetching a page we already have is the single largest
+    reduction in request volume available — which is what actually decides
+    whether a host starts challenging us.
+    """
+
+    # --- adaptive backoff -------------------------------------------------
+    backoff_factor: float = field(default_factory=lambda: _env_float("BACKOFF_FACTOR", 2.0))
+    """How hard to stretch a host's delay each time it pushes back."""
+    max_backoff: float = field(default_factory=lambda: _env_float("MAX_BACKOFF", 16.0))
+    """Ceiling on that stretch, as a multiple of the base delay."""
 
     # --- durability -------------------------------------------------------
     checkpoint_secs: float = field(default_factory=lambda: _env_float("CHECKPOINT_SECS", 120.0))
@@ -118,6 +144,11 @@ class Settings:
     @property
     def runs_dir(self) -> Path:
         return self.data_dir / "runs"
+
+    @property
+    def cache_dir(self) -> Path:
+        """Where fetched responses are kept between runs."""
+        return self.data_dir / "cache"
 
     @property
     def store_path(self) -> Path:
@@ -149,3 +180,5 @@ class Settings:
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
+        if self.cache_ttl > 0:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)

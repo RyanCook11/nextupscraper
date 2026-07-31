@@ -162,6 +162,24 @@ def _common_parser() -> argparse.ArgumentParser:
     )
     group.add_argument("--max-pages", type=int, default=S, help="Max pages to fetch per site.")
     group.add_argument(
+        "--max-sport-pages", type=int, default=S,
+        help="Max /sports/<sport>/coaches pages per site, for sites that publish "
+             "coaches one page per team instead of one staff directory.",
+    )
+    group.add_argument(
+        "--cache-ttl",
+        type=float,
+        default=S,
+        metavar="SECONDS",
+        help="How long a fetched page stays reusable (default: one week).",
+    )
+    group.add_argument(
+        "--no-cache",
+        action="store_true",
+        default=S,
+        help="Re-fetch everything instead of reusing cached pages.",
+    )
+    group.add_argument(
         "--render",
         choices=["never", "auto", "always"],
         default=S,
@@ -193,6 +211,12 @@ def settings_from_args(args: argparse.Namespace) -> Settings:
         settings.concurrency = max(1, args.concurrency)
     if getattr(args, "max_pages", None):
         settings.max_pages_per_site = max(1, args.max_pages)
+    if getattr(args, "max_sport_pages", None):
+        settings.max_sport_pages = max(1, args.max_sport_pages)
+    if getattr(args, "cache_ttl", None) is not None:
+        settings.cache_ttl = max(0.0, args.cache_ttl)
+    if getattr(args, "no_cache", False):
+        settings.cache_ttl = 0.0
     if getattr(args, "render", None):
         settings.render = args.render
     if getattr(args, "headful", False):
@@ -648,8 +672,13 @@ def filter_contacts(
     if coaches_only:
         out = [c for c in out if c.is_coach]
     if sport:
-        needle = sport.lower()
-        out = [c for c in out if needle in f"{c.sport or ''} {c.department or ''}".lower()]
+        # Canonical match, so picking "Basketball" returns its gendered
+        # variants too and "Men's Basketball" narrows to one of them. Falls
+        # back to a substring test, which is what department and free-text
+        # values like "strength" still need.
+        from .sports import matches as sport_matches
+
+        out = [c for c in out if sport_matches(c.sport, sport, department=c.department)]
     if search:
         needle = search.lower()
         out = [c for c in out if needle in json.dumps(c.to_dict()).lower()]

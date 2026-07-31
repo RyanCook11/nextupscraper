@@ -24,6 +24,7 @@ from ..models import (
     SCHOOL_COLUMNS,
     SiteOutcome,
 )
+from ..sources.website import normalize_domain
 from .jobs import JobManager
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -86,6 +87,24 @@ def create_app(settings: Settings) -> FastAPI:
     def load_schools():
         return storage.SchoolStore(settings).load().sorted_leads()
 
+    def _division_by_host() -> dict[str, str]:
+        """``goduke.com -> "DI"``, from the school store.
+
+        A contact has no division of its own — it belongs to the institution,
+        and ``School.athletics_domain`` *is* ``Contact.school_domain``. Joining
+        here rather than copying the value onto every contact keeps one source
+        of truth: re-run ``scrapbot run schools`` and the coaches tab follows,
+        with no backfill and no rows left holding last season's tier.
+        """
+        out: dict[str, str] = {}
+        for school in load_schools():
+            if not school.division:
+                continue
+            for host in (school.athletics_domain, normalize_domain(school.website or "")):
+                if host:
+                    out.setdefault(host, school.division)
+        return out
+
     def _divisions(division: str | None) -> set[str] | None:
         if not division:
             return None
@@ -134,6 +153,7 @@ def create_app(settings: Settings) -> FastAPI:
     def api_contacts(
         search: str | None = None,
         sport: str | None = None,
+        division: str | None = None,
         coaches_only: bool = False,
         direct_email: bool = False,
         has_email: bool = False,
@@ -152,12 +172,18 @@ def create_app(settings: Settings) -> FastAPI:
             direct_email=direct_email,
             search=search,
         )
-        rows = [c.to_dict() for c in contacts]
+        by_host = _division_by_host()
+        rows = [{**c.to_dict(), "division": by_host.get(c.school_domain)} for c in contacts]
+        wanted = _divisions(division)
+        if wanted:
+            rows = [r for r in rows if r["division"] in wanted]
         return {
             "total": len(rows),
             "offset": offset,
             "limit": limit,
-            "columns": CONTACT_CSV_COLUMNS,
+            # Division is joined from the school store, not stored on a contact,
+            # so it is appended here rather than added to the CSV schema.
+            "columns": CONTACT_CSV_COLUMNS + ["division"],
             "contacts": _page(rows, sort, order, offset, limit),
         }
 
@@ -197,12 +223,13 @@ def create_app(settings: Settings) -> FastAPI:
             for hint in lead.industry_hints:
                 industries[hint] = industries.get(hint, 0) + 1
 
-        sports: dict[str, int] = {}
-        for contact in contacts:
-            for sport in (contact.sport or "").split(";"):
-                sport = sport.strip()
-                if sport:
-                    sports[sport] = sports.get(sport, 0) + 1
+        # Canonical labels, grouped so each sport's gender variants sit
+        # together. The raw values run to 2,895 entries, most of them scraped
+        # section headings with a phone number or an administrator's name
+        # attached, which made the filter unusable.
+        from ..sports import options as sport_options
+
+        sports = sport_options(c.sport for c in contacts)
 
         divisions: dict[str, int] = {}
         for school in schools:
@@ -222,7 +249,9 @@ def create_app(settings: Settings) -> FastAPI:
                 "with_email": sum(1 for c in contacts if c.emails),
                 "with_phone": sum(1 for c in contacts if c.phones),
                 "schools": len({c.school_domain for c in contacts}),
-                "sports": dict(sorted(sports.items(), key=lambda kv: -kv[1])),
+                # Already ordered by sport_options: groups by size, variants
+                # adjacent. Re-sorting by count here would scatter them again.
+                "sports": sports,
             },
             "schools": {
                 "total": len(schools),
@@ -408,6 +437,12 @@ def create_app(settings: Settings) -> FastAPI:
                 direct_email=direct_email,
                 search=search,
             )
+            # The division filter has to apply to the download too, or the
+            # button quietly hands back more than the table is showing.
+            wanted = _divisions(division)
+            if wanted:
+                by_host = _division_by_host()
+                records = [c for c in records if by_host.get(c.school_domain) in wanted]
             columns = CONTACT_CSV_COLUMNS
         elif dataset == "schools":
             records = load_schools()

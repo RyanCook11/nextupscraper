@@ -31,6 +31,10 @@ CONTACT_CSV_COLUMNS = [
     "name",
     "title",
     "sport",
+    # The raw heading the directory used, tidied into one of ~83 canonical
+    # labels. Derived on read (see scrapbot.sports), so it is never stored and
+    # can never go stale against the merge rules.
+    "sport_canonical",
     "department",
     "emails",
     "phones",
@@ -299,6 +303,14 @@ class Contact:
 
     def to_row(self) -> dict[str, str]:
         d = self.to_dict()
+        # Computed into this local copy, not into to_dict(), so the CSV gains a
+        # column while contacts.json keeps only what was actually scraped.
+        # Imported here because scrapbot.sports reads the coaches vocabulary,
+        # which imports this module.
+        from .sports import canonical_field
+
+        d["sport_canonical"] = canonical_field(self.sport)
+
         row: dict[str, str] = {}
         for col in self.COLUMNS:
             val = d.get(col)

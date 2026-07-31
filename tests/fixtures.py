@@ -86,7 +86,7 @@ STAFF_DIRECTORY = """<!doctype html>
       <tr><td><a href="/staff-directory/dana-reyes/12">Dana Reyes</a></td>
           <td>Director of Athletics</td>
           <td><a href="mailto:dana.reyes@state.edu">dana.reyes@state.edu</a></td>
-          <td><a href="tel:+15551110001">(555) 111-0001</a></td></tr>
+          <td><a href="tel:+12315550101">(231) 555-0101</a></td></tr>
     </tbody>
   </table>
   <table>
@@ -96,7 +96,7 @@ STAFF_DIRECTORY = """<!doctype html>
       <tr><td><a href="/staff-directory/chris-vance/34">Chris Vance</a></td>
           <td>Head Coach</td>
           <td><a href="mailto:chris.vance@state.edu">chris.vance@state.edu</a></td>
-          <td><a href="tel:+15551110002">(555) 111-0002</a></td></tr>
+          <td><a href="tel:+12315550102">(231) 555-0102</a></td></tr>
       <tr><td><a href="/staff-directory/pat-oduya/35">Pat Oduya</a></td>
           <td>Assistant Coach</td>
           <td><a href="mailto:pat.oduya@state.edu">pat.oduya@state.edu</a></td>
@@ -158,7 +158,7 @@ STAFF_CARDS = """<!doctype html>
       <p>Head Coach</p>
       <a href="/staff-directory/robin-ellis/7">Bio</a>
       <a href="mailto:robin.ellis@cardinal.edu">Email</a>
-      <a href="tel:+15552220003">(555) 222-0003</a></li>
+      <a href="tel:+12315550103">(231) 555-0103</a></li>
     <li class="staff-card"><h3>Jamie Fox</h3>
       <p>Assistant Coach</p>
       <a href="mailto:jamie.fox@cardinal.edu">Email</a></li>
@@ -432,6 +432,16 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/gzipped":
             self._send_gzipped(ABOUT)
             return
+        if path == "/rate-limited":
+            # What a host does when we are asking too often. Retry-After is
+            # short so the backoff tests stay fast.
+            self._send(
+                "<h1>Slow down</h1>",
+                "text/html; charset=utf-8",
+                status=429,
+                extra={"Retry-After": "1"},
+            )
+            return
         if path.startswith("/images/"):
             self._send_bytes(FAKE_JPEG, "image/jpeg")
             return
@@ -467,11 +477,19 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def _send(self, body: str, ctype: str, status: int = 200) -> None:
+    def _send(
+        self,
+        body: str,
+        ctype: str,
+        status: int = 200,
+        extra: dict[str, str] | None = None,
+    ) -> None:
         raw = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(raw)))
+        for name, value in (extra or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(raw)
 

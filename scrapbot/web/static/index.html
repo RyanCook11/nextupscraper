@@ -187,11 +187,12 @@ function when(t) { return esc(String(t || "").replace("T", " ").replace("+00:00"
 const VIEWS = {
   contacts: {
     key: "contacts", sort: "name", endpoint: "/api/contacts",
-    filters: ["sport", "coaches_only", "has_email", "has_phone"],
+    filters: ["sport", "division", "coaches_only", "has_email", "has_phone"],
     placeholder: "Search name, title, email, school…",
     empty: 'No coaches yet. Run <code>scrapbot run coaches --sites goduke.com</code> then refresh.',
     columns: [["name", "Name"], ["title", "Title"], ["sport", "Sport"],
-              ["emails", "Email"], ["phones", "Phone"], ["school", "School"]],
+              ["division", "Div"], ["emails", "Email"], ["phones", "Phone"],
+              ["school", "School"]],
     tiles: (s) => [["Contacts", s.contacts.total], ["Coaching roles", s.contacts.coaches],
                    ["With email", s.contacts.with_email], ["With phone", s.contacts.with_phone],
                    ["Schools", s.contacts.schools]],
@@ -207,6 +208,7 @@ const VIEWS = {
         </div></td>
       <td>${esc(c.title || "")}</td>
       <td>${esc(c.sport || c.department || "")}</td>
+      <td>${c.division ? `<span class="pill">${esc(c.division)}</span>` : ""}</td>
       <td>${(c.emails || []).map((e) => `<a href="mailto:${esc(e)}">${esc(e)}</a>`).join("<br>")}
         ${c.shared_email ? '<small title="This address is on several people\'s rows at this school — an assistant or a shared inbox">shared inbox</small>' : ""}</td>
       <td>${cell(c.phones)}</td>

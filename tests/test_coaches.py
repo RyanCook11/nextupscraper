@@ -44,7 +44,7 @@ def test_table_layout_yields_one_record_per_person():
     assert coach.title == "Head Coach"
     assert coach.sport == "Men's Basketball"
     assert coach.emails == ["chris.vance@state.edu"]
-    assert coach.phones == ["+15551110002"]
+    assert coach.phones == ["+1 231 555 0102"]
     assert coach.profile_url.endswith("/staff-directory/chris-vance/34")
     assert coach.is_coach is True
 
@@ -78,7 +78,7 @@ def test_person_listed_twice_merges_and_keeps_both_groups():
     assert dana.department == "Senior Administration"
     assert dana.sport == "Track & Field"
     assert dana.emails == ["dana.reyes@state.edu"]
-    assert dana.phones == ["+15551110001"]  # kept from the row that had one
+    assert dana.phones == ["+1 231 555 0101"]  # kept from the row that had one
 
 
 def test_single_table_with_section_rows():
@@ -118,9 +118,117 @@ def test_card_layout_fallback():
     assert set(people) == {"Robin Ellis", "Jamie Fox"}
     robin = people["Robin Ellis"]
     assert robin.emails == ["robin.ellis@cardinal.edu"]
-    assert robin.phones == ["+15552220003"]
+    assert robin.phones == ["+1 231 555 0103"]
     assert robin.is_coach is True
     assert robin.sport == "Women's Soccer"
+
+
+def test_a_jersey_number_and_class_year_are_not_part_of_the_name():
+    """Division III directories decorate the name with both.
+
+    Chestnut Hill lists "#42 Matthew Owens '18" — a jersey number in front, the
+    alumni class year behind. Neither belongs in the name field: a search for
+    "Matthew Owens" has to find him, and two records of one coach must not
+    differ only by the year he graduated.
+    """
+    from scrapbot.sources.coaches import normalize_person_name as clean
+
+    assert clean("#13 Robert Spratt") == "Robert Spratt"
+    assert clean("#42 Matthew Owens '18") == "Matthew Owens"
+    assert clean("Aiesha Smith '12") == "Aiesha Smith"
+    assert clean("Camille Dunham '26") == "Camille Dunham"
+    assert clean("Erick Camodeca ’06") == "Erick Camodeca"  # curly apostrophe
+
+    # An apostrophe inside a surname is not a class year.
+    assert clean("Ed O'Melia") == "Ed O'Melia"
+    assert clean("#27 Ed O'Melia") == "Ed O'Melia"
+    assert clean("Kim D'Angelo") == "Kim D'Angelo"
+    assert clean("Anne-Marie O'Shea '99") == "Anne-Marie O'Shea"
+
+    # The surname-comma flip still works, and sees the undecorated name.
+    assert clean("O'Brien, Sean '14") == "Sean O'Brien"
+    assert clean("Baker, Alycia") == "Alycia Baker"
+    assert clean("Smith, Jr.") == "Smith, Jr."
+
+
+def test_a_vacant_post_is_not_a_person():
+    """Directories list unfilled jobs with a placeholder where the name goes.
+
+    SUNY Broome, Cal, Charleston Southern, Denison and Cal Poly between them
+    spell it "TBD", "TBA TBA", "T BA", "TBA ,", ". TBD" and "- Vacant -". Each
+    one is an honest entry — the post really is open — but a contact named TBA
+    is a job opening, not somebody to contact.
+    """
+    from scrapbot.sources.coaches import is_placeholder_name
+
+    for placeholder in (
+        "TBD", "TBA", "T BA", "TBA ,", ". TBD", "TBA ...", "TBD TBD", "TBA TBA",
+        "- Vacant -", "To Be Announced", "to be determined", "Open Position",
+        "POSITION OPEN", "N/A", "",
+    ):
+        assert is_placeholder_name(placeholder), placeholder
+
+    # Real names must survive, including ones that merely start the same way.
+    for name in (
+        "Tim Hays", "Tom Carter", "Nate Bannister", "Tabitha Bannon",
+        "Tyson McDowell", "Ana Reyes", "T.J. Otzelberger", "Naomi Tba-Adjacent",
+    ):
+        assert not is_placeholder_name(name), name
+
+
+def test_a_placeholder_row_is_skipped_by_the_table_parser():
+    people = _parse(
+        """<html><body><table>
+          <tr><th>Name</th><th>Title</th><th>Email</th></tr>
+          <tr><td>Rob Germaine</td><td>Assistant Coach Baseball</td>
+              <td><a href="mailto:germainerd@sunybroome.edu">e</a></td></tr>
+          <tr><td>TBD</td><td>Head Coach Baseball</td>
+              <td><a href="mailto:athleticsdept@sunybroome.edu">e</a></td></tr>
+        </table></body></html>""",
+        "broomehornets.com",
+    )
+    assert [c.name for c in people] == ["Rob Germaine"]
+
+
+def test_a_nested_card_wrapper_is_not_a_second_person():
+    """utrockets.com: a coach's name came out as their phone number.
+
+    The modern Sidearm card nests wrappers three deep, and every one of them
+    holds the single mailto: that marks a person block. The ancestor check that
+    should have skipped the inner ones compared ``id(node)`` — but selectolax
+    returns a fresh Python wrapper on every access, so ``id(node.parent)`` never
+    matched the ``id()`` recorded for that same element and the check never
+    fired. The innermost wrapper is the contact block, whose first ``<a>`` is
+    the ``tel:`` link, so it parsed as a person named "419-530-4796" — and,
+    sharing the outer card's profile URL, it merged over the real name.
+    """
+    from scrapbot.sources.coaches import _parse_cards
+
+    html = """<html><body>
+      <div class="s-person-card">
+        <div class="s-person-card__content">
+          <div class="s-person-details">
+            <a href="/staff-directory/jordan-lauf/590" aria-hidden="true"></a>
+            <h4>Jordan Lauf</h4>
+            <p>Assistant Men's Basketball Coach</p>
+          </div>
+          <div class="s-person-card__content__person-contact-info">
+            <a href="tel:+14195304796">419-530-4796</a>
+            <a href="mailto:jordan.lauf@utoledo.edu">Email</a>
+          </div>
+        </div>
+      </div>
+    </body></html>"""
+    people = _parse_cards(
+        extract.parse(html), "https://utrockets.com/staff-directory",
+        "utrockets.com", "Toledo", "coaches",
+    )
+    assert len(people) == 1, [p.name for p in people]
+    person = people[0]
+    assert person.name == "Jordan Lauf"
+    assert person.title == "Assistant Men's Basketball Coach"
+    assert person.emails == ["jordan.lauf@utoledo.edu"]
+    assert person.phones == ["+1 419 530 4796"]
 
 
 def test_card_title_drops_the_contact_details_it_ran_together():

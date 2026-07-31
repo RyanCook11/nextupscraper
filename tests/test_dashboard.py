@@ -20,9 +20,9 @@ def client(tmp_path):
     settings.data_dir = tmp_path
 
     contacts = storage.ContactStore(settings)
-    contacts.upsert(Contact(name="Chris Vance", school_domain="state.edu", school="State",
+    contacts.upsert(Contact(name="Chris Vance", school_domain="troytrojans.com", school="Troy",
                             title="Head Coach", sport="Men's Basketball", is_coach=True,
-                            emails=["chris.vance@state.edu"], phones=["+15551110002"]))
+                            emails=["chris.vance@state.edu"], phones=["+12315550102"]))
     contacts.upsert(Contact(name="Sam Webb", school_domain="state.edu", school="State",
                             title="Equipment Manager", sport="Men's Basketball"))
     contacts.save()
@@ -349,3 +349,37 @@ def test_empty_stores_do_not_error(tmp_path):
     assert empty.get("/api/stats").json()["contacts"]["total"] == 0
     assert empty.get("/api/contacts").json()["contacts"] == []
     assert empty.get("/api/schools").json()["schools"] == []
+
+
+def test_a_contact_carries_the_division_of_their_school(client):
+    """A contact has no division of its own — it belongs to the institution.
+
+    School.athletics_domain *is* Contact.school_domain, so the coaches tab
+    joins on it rather than copying the tier onto every person. Re-running
+    `scrapbot run schools` then moves the whole tab at once, and nobody is left
+    holding last season's division.
+    """
+    body = client.get("/api/contacts").json()
+    assert "division" in body["columns"]
+    by_name = {c["name"]: c for c in body["contacts"]}
+    assert by_name["Chris Vance"]["division"] == "DI"   # troytrojans.com is on record
+    assert by_name["Sam Webb"]["division"] is None      # state.edu is not
+
+
+def test_contacts_can_be_filtered_by_division(client):
+    assert client.get("/api/contacts?division=DI").json()["total"] == 1
+    assert client.get("/api/contacts?division=DIII").json()["total"] == 0
+    # Accepts the same spellings the schools tab does.
+    assert client.get("/api/contacts?division=I").json()["total"] == 1
+    # ...and combines with the other filters rather than replacing them.
+    assert client.get("/api/contacts?division=DI&coaches_only=true").json()["total"] == 1
+    assert client.get(
+        "/api/contacts?division=DI&sport=volleyball"
+    ).json()["total"] == 0
+
+
+def test_the_csv_download_honours_the_division_filter(client):
+    """Otherwise the button quietly hands back more than the table shows."""
+    body = client.get("/api/export.csv?dataset=contacts&division=DI").text
+    assert "Chris Vance" in body
+    assert "Sam Webb" not in body

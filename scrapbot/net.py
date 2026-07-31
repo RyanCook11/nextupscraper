@@ -13,6 +13,7 @@ from urllib.robotparser import RobotFileParser
 
 import httpx
 
+from .cache import ResponseCache
 from .config import Settings
 from .profiles import SessionProfile, create_session_profile, find_chrome
 
@@ -38,6 +39,8 @@ class Page:
     rendered: bool = False
     error: str = ""
     """Why a non-HTTP failure happened, for the run report."""
+    from_cache: bool = False
+    """True when this came off disk and cost the far end nothing."""
 
     @property
     def ok(self) -> bool:
@@ -57,12 +60,23 @@ class Page:
         return self.status == NETWORK_FAILED
 
 
+# robots.txt is the one document a host may change specifically to tell us to
+# stop, so it gets a much shorter reuse window than a content page.
+ROBOTS_MAX_AGE = 86_400.0
+
+
 class RobotsCache:
     """One RobotFileParser per host, fetched at most once."""
 
-    def __init__(self, client: httpx.AsyncClient, user_agent: str) -> None:
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        user_agent: str,
+        disk: ResponseCache | None = None,
+    ) -> None:
         self._client = client
         self._ua = user_agent
+        self._disk = disk
         self._parsers: dict[str, RobotFileParser | None] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -96,6 +110,18 @@ class RobotsCache:
 
     async def _load(self, scheme: str, host: str) -> RobotFileParser | None:
         robots_url = urlunparse((scheme, host, "/robots.txt", "", "", ""))
+
+        if self._disk is not None:
+            cached = self._disk.get(robots_url)
+            if (
+                cached is not None
+                and cached.age <= ROBOTS_MAX_AGE
+                and isinstance(cached.body, str)
+            ):
+                parser = RobotFileParser()
+                parser.parse(cached.body.splitlines())
+                return parser
+
         try:
             resp = await self._client.get(robots_url)
         except httpx.HTTPError as exc:
@@ -103,6 +129,8 @@ class RobotsCache:
             return None
         if resp.status_code >= 400:
             return None
+        if self._disk is not None:
+            self._disk.put(robots_url, status=resp.status_code, body=resp.text)
         parser = RobotFileParser()
         parser.parse(resp.text.splitlines())
         return parser
@@ -124,6 +152,13 @@ class Fetcher:
         self._robots: RobotsCache | None = None
         self._host_locks: dict[str, asyncio.Lock] = {}
         self._host_last_hit: dict[str, float] = {}
+        # Per-host delay multiplier, grown when a host pushes back and eased
+        # off again while it is answering normally. See ``_penalize``.
+        self._host_penalty: dict[str, float] = {}
+        # Absolute monotonic deadlines from a ``Retry-After``: no request to
+        # the host goes out before this, however many pages want one.
+        self._host_cooldown: dict[str, float] = {}
+        self.cache = ResponseCache(settings.cache_dir, settings.cache_ttl)
         self._playwright = None
         self._browser = None
         self._browser_lock = asyncio.Lock()
@@ -131,7 +166,14 @@ class Fetcher:
         # Hosts whose bot challenge the browser failed to clear, so we stop
         # paying for a render on every subsequent page of that site.
         self._unsolvable_hosts: set[str] = set()
-        self.stats = {"requests": 0, "rendered": 0, "blocked": 0, "errors": 0}
+        self.stats = {
+            "requests": 0,
+            "rendered": 0,
+            "blocked": 0,
+            "errors": 0,
+            "cache_hits": 0,
+            "throttled": 0,
+        }
 
         # Human-mimicry: small random jitter added to delays
         self._jitter_min = getattr(settings, "jitter_min", 0.2)
@@ -147,7 +189,9 @@ class Fetcher:
             timeout=self.settings.timeout,
             headers=headers,
         )
-        self._robots = RobotsCache(self._robots_client, self._default_profile.user_agent)
+        self._robots = RobotsCache(
+            self._robots_client, self._default_profile.user_agent, disk=self.cache
+        )
         return self
 
     async def __aexit__(self, *exc_info: object) -> None:
@@ -162,16 +206,70 @@ class Fetcher:
     async def _throttle(self, host: str, delay: float) -> None:
         lock = self._host_locks.setdefault(host, asyncio.Lock())
         async with lock:
-            last = self._host_last_hit.get(host)
+            # An explicit ``--delay 0`` means the operator wants no pacing at
+            # all (the tests rely on it against a local fixture server), so a
+            # penalty multiplier must not resurrect one.
+            if delay > 0:
+                delay *= self._host_penalty.get(host, 1.0)
+
             now = time.monotonic()
+            waits = []
+
+            cooldown = self._host_cooldown.get(host)
+            if cooldown is not None and cooldown > now:
+                # A server that sent Retry-After has told us exactly how long
+                # to go away for. Honouring it is both the polite answer and
+                # the one least likely to escalate into a hard block.
+                waits.append(cooldown - now)
+
+            last = self._host_last_hit.get(host)
             if last is not None:
-                wait = delay - (now - last)
-                if wait > 0:
-                    # Add small random jitter to avoid perfectly periodic hits
-                    jitter = random.uniform(self._jitter_min, self._jitter_max)
-                    wait += jitter
-                    await asyncio.sleep(wait)
+                gap = delay - (now - last)
+                if gap > 0:
+                    # Jitter so we aren't a metronome, but only when we were
+                    # going to wait anyway.
+                    waits.append(gap + random.uniform(self._jitter_min, self._jitter_max))
+
+            if waits:
+                self.stats["throttled"] += 1
+                await asyncio.sleep(max(waits))
+
             self._host_last_hit[host] = time.monotonic()
+
+    def _penalize(self, host: str, retry_after: float | None = None) -> None:
+        """Back off from a host that just pushed back.
+
+        Called on 429/503 and on the refusal statuses a WAF answers with. The
+        multiplier is deliberately sticky for the rest of the run: a host that
+        rate-limited us once at this pace will do it again at this pace, and
+        the whole point is to stop asking hard enough to get challenged.
+        """
+        current = self._host_penalty.get(host, 1.0)
+        grown = min(current * self.settings.backoff_factor, self.settings.max_backoff)
+        self._host_penalty[host] = grown
+        if retry_after and retry_after > 0:
+            self._host_cooldown[host] = time.monotonic() + retry_after
+        log.debug(
+            "%s pushed back; delay multiplier now %.1fx%s",
+            host,
+            grown,
+            f", holding off {retry_after:.0f}s" if retry_after else "",
+        )
+
+    def _relax(self, host: str) -> None:
+        """Ease a host's penalty back toward normal after a clean response.
+
+        Recovery is slower than escalation on purpose — one 200 in the middle
+        of a rate-limiting streak is not evidence the limit has lifted.
+        """
+        current = self._host_penalty.get(host)
+        if current is None or current <= 1.0:
+            return
+        eased = max(1.0, current / (self.settings.backoff_factor ** 0.5))
+        if eased <= 1.0:
+            self._host_penalty.pop(host, None)
+        else:
+            self._host_penalty[host] = eased
 
     # -- human-like delay helper -----------------------------------------
     async def _human_delay(self, min_sec: float = 0.5, max_sec: float = 2.0) -> None:
@@ -192,6 +290,20 @@ class Fetcher:
             log.info("robots.txt disallows %s — skipping", url)
             return Page(
                 url=url, status=ROBOTS_BLOCKED, html="", error="robots.txt disallow"
+            )
+
+        # Served from disk before anything else costs the far end a request —
+        # and before the pacing delay, so a cached sweep runs at full speed.
+        cached = self.cache.get(url)
+        if cached is not None:
+            self.stats["cache_hits"] += 1
+            log.debug("cache hit for %s (%.0fh old)", url, cached.age / 3600)
+            return Page(
+                url=cached.final_url,
+                status=cached.status,
+                html=cached.body if isinstance(cached.body, str) else "",
+                rendered=cached.rendered,
+                from_cache=True,
             )
 
         # Fresh profile per request (UA + headers), sent over the shared,
@@ -278,6 +390,11 @@ class Fetcher:
             self.stats["blocked"] += 1
             return None
 
+        cached = self.cache.get(url)
+        if cached is not None and isinstance(cached.body, bytes):
+            self.stats["cache_hits"] += 1
+            return cached.body[:max_bytes] if cached.body else None
+
         host = urlparse(url).netloc
         delay = max(self.settings.delay, await self._robots.crawl_delay(url) or 0)
         await self._throttle(host, delay)
@@ -295,12 +412,24 @@ class Fetcher:
             self.stats["errors"] += 1
             return None
 
+        if resp.status_code in (429, 503):
+            self._penalize(host)
         if resp.status_code != 200:
             return None
-        if not resp.headers.get("content-type", "").startswith("image/"):
+        ctype = resp.headers.get("content-type", "")
+        if not ctype.startswith("image/"):
             return None
         data = resp.content
-        return data[:max_bytes] if data else None
+        if not data:
+            return None
+        self.cache.put(
+            url,
+            status=resp.status_code,
+            body=data[:max_bytes],
+            final_url=str(resp.url),
+            content_type=ctype,
+        )
+        return data[:max_bytes]
 
     async def _get_static(
         self,
@@ -327,13 +456,25 @@ class Fetcher:
                 await asyncio.sleep(min(2**attempt, 8))
                 continue
 
+            retry_after_hdr = resp.headers.get("retry-after")
+            retry_after = (
+                float(retry_after_hdr) if (retry_after_hdr or "").isdigit() else None
+            )
+
+            if resp.status_code in (429, 503):
+                # The two statuses that mean "you are asking too often". Slow
+                # this host down for the rest of the run, not just for the
+                # length of one sleep.
+                self._penalize(host, retry_after)
+            elif resp.status_code in (401, 403, 405, 406, 451):
+                # A refusal rather than a rate limit, but hammering through it
+                # is what turns a soft block into a hard one.
+                self._penalize(host)
+            elif 200 <= resp.status_code < 400:
+                self._relax(host)
+
             if resp.status_code in (429, 500, 502, 503, 504) and attempt < self.settings.max_retries:
-                retry_after = resp.headers.get("retry-after")
-                sleep_for = (
-                    float(retry_after)
-                    if (retry_after or "").isdigit()
-                    else min(2**attempt, 8)
-                )
+                sleep_for = retry_after if retry_after is not None else min(2**attempt, 8)
                 log.debug("%s returned %s, backing off %.1fs", url, resp.status_code, sleep_for)
                 await asyncio.sleep(sleep_for)
                 continue
@@ -342,6 +483,13 @@ class Fetcher:
             if "html" not in ctype and "xml" not in ctype:
                 return Page(url=str(resp.url), status=resp.status_code, html="")
             html = resp.text[: self.settings.max_bytes_per_page]
+            self.cache.put(
+                url,
+                status=resp.status_code,
+                body=html,
+                final_url=str(resp.url),
+                content_type=ctype,
+            )
             return Page(url=str(resp.url), status=resp.status_code, html=html)
 
         self.stats["errors"] += 1
@@ -454,12 +602,14 @@ class Fetcher:
             html = await page.content()
             self.stats["requests"] += 1
             self.stats["rendered"] += 1
-            return Page(
-                url=page.url,
-                status=resp.status if resp else 200,
-                html=html[: self.settings.max_bytes_per_page],
-                rendered=True,
+            status = resp.status if resp else 200
+            html = html[: self.settings.max_bytes_per_page]
+            # Worth caching more than a static page is: a render costs a
+            # browser launch on our side and a full asset load on theirs.
+            self.cache.put(
+                url, status=status, body=html, final_url=page.url, rendered=True
             )
+            return Page(url=page.url, status=status, html=html, rendered=True)
         except Exception as exc:
             self.stats["errors"] += 1
             log.info("render failed for %s: %s", url, exc)

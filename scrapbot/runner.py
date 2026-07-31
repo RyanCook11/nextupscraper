@@ -111,6 +111,7 @@ async def _run_source(
                 store.save(checkpoint=True)
                 last_checkpoint = time.monotonic()
         result.fetch_stats = dict(fetcher.stats)
+        result.fetch_stats["cache"] = fetcher.cache.stats()
 
     result.outcomes = list(source.outcomes)
     result.seconds = time.monotonic() - started

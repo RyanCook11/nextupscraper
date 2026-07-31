@@ -55,6 +55,15 @@ def main() -> int:
                         help="Write the changes. Without this, only report them.")
     parser.add_argument("--data-dir", type=Path, help="Override the data directory.")
     parser.add_argument("--limit", type=int, default=15, help="Examples to print.")
+    parser.add_argument(
+        "--sports-only",
+        action="store_true",
+        help="Backfill sports and leave departments alone. The two repairs are "
+        "independent, and the 'every value at this school is unique' rule below "
+        "is a fair guess on a fresh parse but too blunt for a store-wide sweep: "
+        "it clears real departments ('Administration', 'Facilities') at small "
+        "schools. scripts/fix_departments.py does the name-bleed half exactly.",
+    )
     args = parser.parse_args()
 
     settings = Settings()
@@ -84,6 +93,8 @@ def main() -> int:
         domain for domain, counts in departments.items()
         if len(counts) >= 3 and all(n == 1 for n in counts.values())
     }
+    if args.sports_only:
+        all_unique = set()
     if all_unique:
         print("schools where every department value is unique (treated as bled names):")
         for domain in sorted(all_unique):
@@ -95,7 +106,7 @@ def main() -> int:
         dept = (contact.department or "").strip()
         colleague = dept.lower() in names.get(contact.school_domain, set()) \
             and dept.lower() != contact.name.strip().lower()
-        if dept and (colleague or contact.school_domain in all_unique):
+        if dept and not args.sports_only and (colleague or contact.school_domain in all_unique):
             unfiled.append((contact.name, dept))
             contact.department = None
 

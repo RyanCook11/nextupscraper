@@ -325,7 +325,63 @@ def clean_phone(raw: str) -> str | None:
         # source explicitly marked it international.
         if not candidate.startswith("+"):
             return None
-    return candidate
+    return format_phone(candidate)
+
+
+def format_phone(candidate: str) -> str:
+    """Put a North American number into one shape: ``+1 231 555 0199``.
+
+    Directories publish the same number a dozen ways — "443 454 5206" from a
+    table cell, "+14324663753" from the ``tel:`` link beside it, "(805)
+    922-6966 ext. 3227" in running text. Stored as-is they are different
+    strings, so the same person's number fails to de-duplicate and a caller has
+    to reformat every row by hand.
+
+    Only genuine NANP numbers are touched, judged on the rules the plan
+    actually has: a 10-digit number, or 11 beginning with the country code 1,
+    whose area code and exchange both start 2-9. Anything else — a nine-digit
+    fragment, an international number, digit soup that survived the checks
+    above — is handed back untouched rather than forced into a shape it does
+    not fit.
+
+    Trailing digits past the number are an extension, not part of it: Allan
+    Hancock lists six staff on 805 922 6966 with a different extension each.
+    They are kept as ``x3227`` so the switchboard number still de-duplicates.
+    """
+    digits = re.sub(r"\D", "", candidate)
+    # A leading "+" on anything but country code 1 is the source stating its
+    # own country, and it is not ours to reinterpret. Without this, the
+    # Australian "+61 2 9876 5432" reads as eleven grouped digits and comes out
+    # as "+1 612 987 6543 x2" — a plausible-looking Michigan number that does
+    # not exist. scrapbot's other sources are pointed at .com.au sites, so this
+    # is not hypothetical.
+    if candidate.lstrip().startswith("+") and not digits.startswith("1"):
+        return candidate
+    # Whether the source itself broke the number up. This is what separates
+    # "401 232 6828 1" — a number with a one-digit extension — from
+    # "+81397466225", a Japanese number that happens to be the same length.
+    # Only the first was written as separate groups, so only the first may have
+    # its tail read as an extension.
+    grouped = bool(re.search(r"\d\D+\d", candidate))
+
+    if len(digits) == 10:
+        base, extension = digits, ""
+    elif len(digits) == 11 and digits.startswith("1"):
+        base, extension = digits[1:], ""
+    elif len(digits) > 11 and digits.startswith("1"):
+        base, extension = digits[1:11], digits[11:]
+    elif len(digits) > 10 and grouped:
+        base, extension = digits[:10], digits[10:]
+    else:
+        return candidate
+    if len(extension) > 6:  # too long to be an extension — leave it alone
+        return candidate
+
+    if base[0] in "01" or base[3] in "01":
+        return candidate  # not a dialable NANP number
+
+    formatted = f"+1 {base[:3]} {base[3:6]} {base[6:]}"
+    return f"{formatted} x{extension}" if extension else formatted
 
 
 def has_open_roles(text: str) -> bool:

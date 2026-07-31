@@ -1,0 +1,335 @@
+<title>Canonical sports — scrapbot</title>
+
+<style>
+  :root {
+    color-scheme: light;
+    --surface:        #fbfbfc;
+    --panel:          #f3f4f7;
+    --panel-2:        #e9ebef;
+    --rule:           #dcdfe6;
+    --ink:            #12141a;
+    --ink-2:          #565b66;
+    --ink-3:          #868c99;
+    --men:            #2a78d6;
+    --women:          #eb6834;
+    --unspec:         #b6bcc6;
+    --accent:         #2a78d6;
+    --warn-bg:        #fdf3e8;
+    --shadow:         0 1px 2px rgba(18,20,26,.06), 0 8px 24px rgba(18,20,26,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface: #16181c; --panel: #1e2126; --panel-2: #262a31; --rule: #30353d;
+      --ink: #f2f4f7; --ink-2: #a9afba; --ink-3: #767d8a;
+      --men: #3987e5; --women: #d95926; --unspec: #4e555f; --accent: #3987e5;
+      --warn-bg: #2a2118;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.28);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface: #16181c; --panel: #1e2126; --panel-2: #262a31; --rule: #30353d;
+    --ink: #f2f4f7; --ink-2: #a9afba; --ink-3: #767d8a;
+    --men: #3987e5; --women: #d95926; --unspec: #4e555f; --accent: #3987e5;
+    --warn-bg: #2a2118;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px rgba(0,0,0,.28);
+  }
+
+  * { box-sizing: border-box; }
+
+  .page {
+    background: var(--surface); color: var(--ink);
+    font: 400 15px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    min-height: 100vh; padding: 48px 24px 72px;
+  }
+  .wrap { max-width: 1120px; margin: 0 auto; display: flex; flex-direction: column; gap: 34px; }
+
+  .eyebrow { font: 600 11px/1 system-ui, sans-serif; letter-spacing: .16em; text-transform: uppercase; color: var(--ink-3); }
+  h1 {
+    margin: 0;
+    font-family: "Arial Narrow", "Helvetica Neue", "Liberation Sans Narrow", system-ui, sans-serif;
+    font-size: clamp(36px, 5.6vw, 58px); font-weight: 700; line-height: .97;
+    letter-spacing: -.015em; text-wrap: balance;
+  }
+  .masthead { display: flex; flex-direction: column; gap: 10px; }
+  .standfirst { margin: 0; max-width: 64ch; color: var(--ink-2); font-size: 16.5px; }
+
+  .transform {
+    display: flex; align-items: center; gap: 20px; flex-wrap: wrap;
+    padding: 20px 24px; background: var(--panel); border: 1px solid var(--rule); border-radius: 3px;
+  }
+  .tnum {
+    font-family: "Arial Narrow", "Helvetica Neue", system-ui, sans-serif;
+    font-size: 44px; font-weight: 700; line-height: 1;
+    font-variant-numeric: tabular-nums; letter-spacing: -.01em;
+  }
+  .tcell { display: flex; flex-direction: column; gap: 5px; }
+  .tlabel { font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-3); }
+  .arrow { color: var(--ink-3); font-size: 24px; line-height: 1; }
+  .tnote { margin-left: auto; max-width: 33ch; font-size: 13.5px; color: var(--ink-2); }
+
+  .cols { display: grid; grid-template-columns: minmax(330px, 400px) 1fr; gap: 30px; align-items: start; }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+
+  .colhead {
+    font: 600 11px/1 system-ui, sans-serif; letter-spacing: .13em;
+    text-transform: uppercase; color: var(--ink-3); margin-bottom: 11px;
+  }
+
+  /* ---- dropdown preview ---- */
+  .select {
+    border: 1px solid var(--rule); border-radius: 3px; background: var(--panel);
+    max-height: 620px; overflow-y: auto; box-shadow: var(--shadow);
+  }
+  .opt {
+    display: flex; align-items: center; gap: 9px;
+    padding: 6px 13px; font-size: 13.5px; border-bottom: 1px solid transparent;
+  }
+  .opt.all { font-weight: 600; border-bottom: 1px solid var(--rule); }
+  .opt.head { padding-top: 11px; font-weight: 600; }
+  .opt.sub { padding-left: 30px; color: var(--ink-2); }
+  .opt:hover { background: var(--panel-2); }
+  .opt .n { margin-left: auto; font-size: 12px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+  .dot { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+  .dot.m { background: var(--men); }
+  .dot.w { background: var(--women); }
+  .dot.u { background: var(--unspec); }
+  .opt.faint { opacity: .55; }
+
+  /* ---- chart ---- */
+  .row {
+    display: grid; grid-template-columns: 24px 148px 1fr 60px;
+    align-items: center; gap: 13px; padding: 6px 0; border-bottom: 1px solid var(--rule);
+  }
+  .row:first-child { border-top: 1px solid var(--rule); }
+  .rank { font-size: 12px; color: var(--ink-3); text-align: right; font-variant-numeric: tabular-nums; }
+  .sport { font-size: 14px; font-weight: 500; }
+  .bar { display: flex; height: 15px; gap: 2px; }
+  .seg { height: 100%; border-radius: 1px; }
+  .seg:first-child { border-top-left-radius: 4px; border-bottom-left-radius: 4px; }
+  .seg:last-child { border-top-right-radius: 4px; border-bottom-right-radius: 4px; }
+  .seg.m { background: var(--men); } .seg.w { background: var(--women); } .seg.u { background: var(--unspec); }
+  .seg:hover { filter: brightness(1.12); }
+  .total { font-size: 13px; text-align: right; font-variant-numeric: tabular-nums; color: var(--ink-2); }
+
+  .legend { display: flex; gap: 17px; flex-wrap: wrap; margin-bottom: 12px; }
+  .lg { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--ink-2); }
+  .sw { width: 11px; height: 11px; border-radius: 2px; }
+  .sw.m { background: var(--men); } .sw.w { background: var(--women); } .sw.u { background: var(--unspec); }
+
+  .tip {
+    position: fixed; z-index: 20; pointer-events: none; opacity: 0;
+    transform: translate(-50%, -114%); transition: opacity .12s;
+    background: var(--panel); color: var(--ink); border: 1px solid var(--rule);
+    border-radius: 4px; box-shadow: var(--shadow); padding: 9px 12px;
+    min-width: 172px; font-size: 12.5px; line-height: 1.5;
+  }
+  .tip[data-show="1"] { opacity: 1; }
+  .tip b { font-size: 13.5px; display: block; margin-bottom: 5px; }
+  .tip .tr { display: flex; justify-content: space-between; gap: 16px; }
+  .tip .tr span:last-child { font-variant-numeric: tabular-nums; }
+
+  .notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(268px, 1fr)); gap: 18px; }
+  .note {
+    padding: 18px 20px; background: var(--panel); border: 1px solid var(--rule);
+    border-radius: 3px; display: flex; flex-direction: column; gap: 7px;
+  }
+  .note.flag { background: var(--warn-bg); }
+  .note h3 {
+    margin: 0; font: 600 12px/1.3 system-ui, sans-serif;
+    letter-spacing: .09em; text-transform: uppercase; color: var(--ink-3);
+  }
+  .note p { margin: 0; font-size: 13.5px; color: var(--ink-2); line-height: 1.62; }
+  code {
+    font-family: ui-monospace, "SF Mono", Consolas, monospace; font-size: 12.5px;
+    background: var(--panel-2); padding: 1px 5px; border-radius: 3px; color: var(--ink);
+  }
+  footer { color: var(--ink-3); font-size: 12.5px; border-top: 1px solid var(--rule); padding-top: 16px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="page">
+<div class="wrap">
+
+  <header class="masthead">
+    <div class="eyebrow">scrapbot · coaches store · 31 July 2026</div>
+    <h1>The sports filter, with gender kept</h1>
+    <p class="standfirst">Every gender variant stays a real option — <strong>Football</strong>,
+      <strong>Men's Football</strong>, <strong>Women's Football</strong> — but grouped under its
+      sport instead of scattered through an alphabetical list. 83 entries, down from 2,895.</p>
+  </header>
+
+  <section class="transform" aria-label="Before and after">
+    <div class="tcell"><div class="tnum" style="color:var(--ink-3)">2,895</div><div class="tlabel">raw values</div></div>
+    <div class="arrow" aria-hidden="true">→</div>
+    <div class="tcell"><div class="tnum" style="color:var(--accent)">83</div><div class="tlabel">dropdown entries</div></div>
+    <div class="arrow" aria-hidden="true">→</div>
+    <div class="tcell"><div class="tnum" style="color:var(--ink-2)">30</div><div class="tlabel">groups</div></div>
+    <p class="tnote">All 60,457 rows carrying a sport resolve. Nothing needs a fallback bucket.</p>
+  </section>
+
+  <div class="cols">
+    <section>
+      <div class="colhead">Dropdown, as it would read</div>
+      <div class="select" id="select"></div>
+    </section>
+
+    <section>
+      <div class="colhead">Where the coaches actually are</div>
+      <div class="legend">
+        <span class="lg"><span class="sw u"></span> Ungendered</span>
+        <span class="lg"><span class="sw m"></span> Men's</span>
+        <span class="lg"><span class="sw w"></span> Women's</span>
+      </div>
+      <div id="chart"></div>
+    </section>
+  </div>
+
+  <section class="notes">
+    <div class="note flag">
+      <h3>21 entries are near-empty</h3>
+      <p>Men's Football (7), Women's Football (2), Men's Baseball (21), Women's Softball (38),
+        Women's Cheerleading (3) — heading artefacts, not real programs. Suppress variants under a
+        threshold and the list drops to about 62 without losing anything real.</p>
+    </div>
+    <div class="note flag">
+      <h3>One exception that matters</h3>
+      <p><strong>Women's Flag Football is 171 of 281</strong> — a genuine and fast-growing program.
+        It looks small enough to cut by a blanket rule, so any threshold needs to be on the
+        <em>variant</em>, not the sport.</p>
+    </div>
+    <div class="note">
+      <h3>The ungendered row is not a third gender</h3>
+      <p>Football's 8,626 and Baseball's 4,703 are rows where no directory stated a gender. Keep it
+        selectable — it is where most of those coaches live — but label it plainly so nobody reads
+        it as "mixed".</p>
+    </div>
+    <div class="note">
+      <h3>Selecting a sport must include its variants</h3>
+      <p>Picking <strong>Basketball</strong> should return all 11,762, not the 307 ungendered rows.
+        With 4,912 coaches holding two sports, the filter has to match <em>contains</em> —
+        equality would hide every dual-program coach.</p>
+    </div>
+  </section>
+
+  <footer>
+    Derived from <code>data/contacts.json</code> — 80,599 contacts, 60,457 carrying a sport.
+    Read-only analysis; no parser or store changes were made to produce it.
+  </footer>
+
+</div>
+</div>
+
+<div class="tip" id="tip" role="status" aria-live="polite"></div>
+
+<script>
+  const GROUPS = [
+    ["Basketball",11762,[["Basketball",307],["Men's Basketball",6969],["Women's Basketball",4486]]],
+    ["Football",8635,[["Football",8626],["Men's Football",7],["Women's Football",2]]],
+    ["Soccer",6834,[["Soccer",568],["Men's Soccer",3158],["Women's Soccer",3108]]],
+    ["Track & Field",6466,[["Track & Field",2780],["Men's Track & Field",1763],["Women's Track & Field",1923]]],
+    ["Baseball",4724,[["Baseball",4703],["Men's Baseball",21]]],
+    ["Cross Country",4395,[["Cross Country",1943],["Men's Cross Country",1182],["Women's Cross Country",1270]]],
+    ["Swimming & Diving",4187,[["Swimming & Diving",2305],["Men's Swimming & Diving",850],["Women's Swimming & Diving",1032]]],
+    ["Volleyball",4103,[["Volleyball",1948],["Men's Volleyball",556],["Women's Volleyball",1599]]],
+    ["Softball",3663,[["Softball",3625],["Women's Softball",38]]],
+    ["Tennis",3139,[["Tennis",424],["Men's Tennis",1279],["Women's Tennis",1436]]],
+    ["Golf",3061,[["Golf",622],["Men's Golf",1255],["Women's Golf",1184]]],
+    ["Lacrosse",2548,[["Lacrosse",212],["Men's Lacrosse",1168],["Women's Lacrosse",1168]]],
+    ["Wrestling",1689,[["Wrestling",751],["Men's Wrestling",550],["Women's Wrestling",388]]],
+    ["Rowing",747,[["Rowing",256],["Men's Rowing",196],["Women's Rowing",295]]],
+    ["Field Hockey",735,[["Field Hockey",720],["Women's Field Hockey",15]]],
+    ["Ice Hockey",709,[["Ice Hockey",69],["Men's Ice Hockey",369],["Women's Ice Hockey",271]]],
+    ["Cheerleading",532,[["Cheerleading",529],["Women's Cheerleading",3]]],
+    ["Bowling",397,[["Bowling",121],["Men's Bowling",102],["Women's Bowling",174]]],
+    ["Gymnastics",342,[["Gymnastics",225],["Men's Gymnastics",35],["Women's Gymnastics",82]]],
+    ["Water Polo",328,[["Water Polo",52],["Men's Water Polo",129],["Women's Water Polo",147]]],
+    ["Beach Volleyball",302,[["Beach Volleyball",243],["Men's Beach Volleyball",8],["Women's Beach Volleyball",51]]],
+    ["Flag Football",281,[["Flag Football",110],["Women's Flag Football",171]]],
+    ["Fencing",234,[["Fencing",99],["Men's Fencing",59],["Women's Fencing",76]]],
+    ["Rugby",225,[["Rugby",35],["Men's Rugby",86],["Women's Rugby",104]]],
+    ["Squash",155,[["Squash",68],["Men's Squash",45],["Women's Squash",42]]],
+    ["Equestrian",145,[["Equestrian",142],["Women's Equestrian",3]]],
+    ["Skiing",104,[["Skiing",84],["Men's Skiing",10],["Women's Skiing",10]]],
+    ["Sailing",87,[["Sailing",82],["Women's Sailing",5]]],
+    ["Triathlon",64,[["Triathlon",26],["Men's Triathlon",2],["Women's Triathlon",36]]],
+    ["Rifle",50,[["Rifle",41],["Men's Rifle",2],["Women's Rifle",7]]]
+  ];
+
+  const fmt = n => n.toLocaleString("en-US");
+  const THRESHOLD = 50;          // below this a variant is a heading artefact, not a program
+  const kindOf = label => label.startsWith("Men's") ? "m" : label.startsWith("Women's") ? "w" : "u";
+
+  /* ---- dropdown preview ---- */
+  const sel = document.getElementById("select");
+  const all = document.createElement("div");
+  all.className = "opt all";
+  all.innerHTML = '<span>All sports</span><span class="n">' +
+    fmt(GROUPS.reduce((s, g) => s + g[1], 0)) + "</span>";
+  sel.appendChild(all);
+
+  GROUPS.forEach(([base, total, variants]) => {
+    variants.forEach(([label, n]) => {
+      const isHead = label === base;
+      const row = document.createElement("div");
+      row.className = "opt " + (isHead ? "head" : "sub") + (n < THRESHOLD ? " faint" : "");
+      row.innerHTML =
+        '<span class="dot ' + kindOf(label) + '"></span>' +
+        "<span>" + label + '</span><span class="n">' + fmt(n) + "</span>";
+      row.title = n < THRESHOLD ? "Below the " + THRESHOLD + "-row threshold — likely a heading artefact" : "";
+      sel.appendChild(row);
+    });
+  });
+
+  /* ---- chart ---- */
+  const chart = document.getElementById("chart");
+  const tip = document.getElementById("tip");
+  const MAX = Math.max(...GROUPS.map(g => g[1]));
+
+  GROUPS.forEach(([base, total, variants], i) => {
+    const counts = { u: 0, m: 0, w: 0 };
+    variants.forEach(([label, n]) => { counts[kindOf(label)] += n; });
+
+    const row = document.createElement("div");
+    row.className = "row";
+
+    const rank = document.createElement("div");
+    rank.className = "rank"; rank.textContent = i + 1;
+
+    const name = document.createElement("div");
+    name.className = "sport"; name.textContent = base;
+
+    const bar = document.createElement("div");
+    bar.className = "bar";
+    bar.style.width = (total / MAX * 100) + "%";
+
+    [["u", "Ungendered"], ["m", "Men's"], ["w", "Women's"]].forEach(([k, ll]) => {
+      if (!counts[k]) return;
+      const seg = document.createElement("div");
+      seg.className = "seg " + k;
+      seg.style.flex = counts[k] + " 0 0";
+      seg.setAttribute("aria-label", base + " " + ll + " " + fmt(counts[k]));
+      const show = ev => {
+        tip.innerHTML = "<b>" + base + "</b>" +
+          variants.map(([label, n]) =>
+            '<div class="tr"><span>' + label + "</span><span>" + fmt(n) + "</span></div>").join("") +
+          '<div class="tr" style="margin-top:5px;font-weight:600"><span>Total</span><span>' +
+          fmt(total) + "</span></div>";
+        tip.dataset.show = "1";
+        tip.style.left = ev.clientX + "px";
+        tip.style.top = ev.clientY + "px";
+      };
+      seg.addEventListener("mouseenter", show);
+      seg.addEventListener("mousemove", show);
+      seg.addEventListener("mouseleave", () => { tip.dataset.show = "0"; });
+      bar.appendChild(seg);
+    });
+
+    const tot = document.createElement("div");
+    tot.className = "total"; tot.textContent = fmt(total);
+
+    row.append(rank, name, bar, tot);
+    chart.appendChild(row);
+  });
+</script>
