@@ -23,6 +23,81 @@ def run_id() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
+class StoreBusy(RuntimeError):
+    """Another run already holds the store."""
+
+
+class StoreLock:
+    """Exclusive advisory lock over one data directory.
+
+    Every run loads the whole store, merges in memory and writes it back, so
+    two runs against the same ``--data-dir`` do not interleave — the second to
+    finish overwrites the first's work wholesale, and with mid-run checkpoints
+    they clobber each other repeatedly. That is silent: both runs report
+    success and the contacts simply are not there afterwards.
+
+    The lock is taken by the operating system on an open descriptor, so a run
+    that is killed or crashes releases it immediately. There is no stale lock
+    file to detect or clean up, which is the part hand-rolled PID files get
+    wrong.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.path = settings.data_dir / ".scrapbot.lock"
+        self._fd: int | None = None
+
+    def __enter__(self) -> "StoreLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            _lock_exclusive(fd)
+        except OSError as exc:
+            os.close(fd)
+            raise StoreBusy(
+                f"another scrapbot run is using {self.path.parent} — "
+                f"wait for it to finish, or pass a different --data-dir"
+            ) from exc
+        os.truncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+        self._fd = fd
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        if self._fd is None:
+            return
+        try:
+            _unlock(self._fd)
+        finally:
+            os.close(self._fd)
+            self._fd = None
+
+
+def _lock_exclusive(fd: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass  # closing the descriptor releases it anyway
+
+
 def _write_atomic(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -107,7 +182,13 @@ class RecordStore:
     def sorted_leads(self) -> list[Record]:
         return sorted(self.leads.values(), key=lambda lead: lead.key)
 
-    def save(self) -> None:
+    def save(self, *, checkpoint: bool = False) -> None:
+        """Write the merged store.
+
+        Both files go out through :func:`_write_atomic`, so a mid-run
+        checkpoint can never leave a half-written store behind: readers see
+        either the previous version or the new one.
+        """
         self.settings.ensure_dirs()
         leads = self.sorted_leads()
         write_json(
@@ -119,7 +200,10 @@ class RecordStore:
             },
         )
         write_csv(self.csv_path, leads, self.record_cls.COLUMNS)
-        log.info("store now holds %d %s(s) -> %s", len(leads), self.noun, self.json_path)
+        if checkpoint:
+            log.info("checkpoint: %d %s(s) saved so far", len(leads), self.noun)
+        else:
+            log.info("store now holds %d %s(s) -> %s", len(leads), self.noun, self.json_path)
 
 
 class LeadStore(RecordStore):

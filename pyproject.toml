@@ -13,10 +13,21 @@ dependencies = [
     "pypdf>=4.0",
     # Reading hand-maintained school lists supplied as spreadsheets.
     "openpyxl>=3.1",
+    # Patches the headless-Chrome tells (window.chrome, navigator.plugins,
+    # navigator.languages). 2.0 renamed the entry point to Stealth.apply_stealth_async.
+    "playwright-stealth>=2.0",
+    # Reads .env so the API key and tuning knobs live in the project, not the
+    # shell. See scrapbot.config._load_dotenv.
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+markers = [
+    "browser: needs a real Playwright browser (deselect with -m 'not browser')",
+]
 
 [project.scripts]
 scrapbot = "scrapbot.cli:main"

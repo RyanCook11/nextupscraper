@@ -261,6 +261,10 @@ class CoachesSource(Source):
     def __init__(self, settings, args) -> None:
         super().__init__(settings, args)
         self._host_map: dict[str, str] | None = None
+        # Hosts already given one browser attempt after the static HTML parsed
+        # to nobody, so a site that needs a browser costs one render, not one
+        # per candidate path we try on it.
+        self._render_tried: set[str] = set()
 
     @classmethod
     def add_arguments(cls, parser: argparse.ArgumentParser) -> None:
@@ -533,7 +537,7 @@ class CoachesSource(Source):
             # page as given rather than second-guessing whether it's athletic.
             got = await fetcher.get(direct_url)
             attempts.append(got)
-            found = self._candidate(got, domain) if got.ok else None
+            found = await self._candidate(got, domain, fetcher) if got.ok else None
         else:
             found = await self._find_directory(fetcher, domain, attempts=attempts)
 
@@ -624,8 +628,36 @@ class CoachesSource(Source):
         if saved:
             log.info("saved %d headshot(s) to %s", saved, self.settings.data_dir / "photos")
 
-    def _candidate(self, page: Page, domain: str) -> Candidate | None:
-        """Parse a fetched page and judge whether it is an athletics directory."""
+    async def _candidate(
+        self, page: Page, domain: str, fetcher: Fetcher | None = None
+    ) -> Candidate | None:
+        """Parse a fetched page and judge whether it is an athletics directory.
+
+        A page that answers 200 and parses to nobody is the signature of a
+        script-built directory — Arizona State serves 375 people that way and
+        none of them are in the static HTML. That is a far sharper trigger than
+        ``render=auto``'s visible-text heuristic, which measures the page
+        *chrome* rather than the staff table: ASU's shell carries 1,639
+        characters and so never tripped the 600-character threshold.
+        """
+        found = self._parse_page(page, domain)
+        if found is not None or fetcher is None:
+            return found
+
+        # Nothing on the static HTML. One browser attempt, then give up: the
+        # memo on the fetcher stops a hostile host from being retried per page.
+        if page.rendered or domain in self._render_tried:
+            return None
+        self._render_tried.add(domain)
+        rendered = await fetcher.get_rendered(page.url)
+        if not rendered.ok:
+            return None
+        found = self._parse_page(rendered, domain)
+        if found is not None:
+            log.info("%s only lists its staff once rendered", page.url)
+        return found
+
+    def _parse_page(self, page: Page, domain: str) -> Candidate | None:
         if not _looks_like_directory(page.html):
             return None
         tree = extract.parse(page.html)
@@ -667,7 +699,7 @@ class CoachesSource(Source):
             return None
 
         async def consider(page: Page) -> Candidate | None:
-            found = self._candidate(page, domain)
+            found = await self._candidate(page, domain, fetcher)
             if found is None:
                 return None
             if found.athletics:
@@ -708,7 +740,62 @@ class CoachesSource(Source):
                 if hit is not None:
                     return hit
 
+            # Some programs publish no combined directory at all — Arizona and
+            # Cal State Fullerton put the staff on one page per sport instead.
+            # Walking those is the only way to see their coaches, so it runs
+            # last: it costs one request per sport.
+            hit = await self._sport_coach_pages(fetcher, base, domain, tree, seen)
+            if hit is not None:
+                return hit
+
         return _coaches_only(general, domain)
+
+    async def _sport_coach_pages(
+        self, fetcher: Fetcher, base: str, domain: str, home_tree, seen: list[Page]
+    ) -> Candidate | None:
+        """Collect ``/sports/<sport>/coaches`` pages into one candidate."""
+        slugs = _sport_slugs(home_tree)
+        if not slugs:
+            return None
+
+        budget = max(0, self.settings.max_pages_per_site - len(seen))
+        if budget <= 0:
+            return None
+        if len(slugs) > budget:
+            log.info(
+                "%s: %d sports but only %d request(s) of budget left; "
+                "raise --max-pages to cover them all",
+                domain, len(slugs), budget,
+            )
+            slugs = slugs[:budget]
+
+        contacts: list[Contact] = []
+        school: str | None = None
+        first: Page | None = None
+        for slug in slugs:
+            page = await fetcher.get(f"{base}/sports/{slug}/coaches")
+            seen.append(page)
+            if not page.ok or not _looks_like_directory(
+                page.html, MIN_SPORT_PAGE_SIGNALS
+            ):
+                continue
+            tree = extract.parse(page.html)
+            school = school or _school_name(tree, domain)
+            found = parse_directory(tree, page.url, domain, school, self.name)
+            if found:
+                first = first or page
+                contacts.extend(found)
+
+        if not contacts or first is None:
+            return None
+        contacts = _dedupe(contacts)
+        log.info("%s: %d coach(es) across %d sport page(s)", domain, len(contacts), len(slugs))
+        return Candidate(
+            page=first,
+            contacts=contacts,
+            school=school,
+            athletics=is_athletics_directory(contacts),
+        )
 
     async def _working_base(
         self, fetcher: Fetcher, domain: str, seen: list[Page]
@@ -752,6 +839,11 @@ def parse_directory(
 ) -> list[Contact]:
     """Parse a staff-directory page into one :class:`Contact` per person."""
     contacts = _parse_tables(tree, base_url, domain, school, source)
+    if not contacts:
+        # Sidearm's current template, before the generic card fallback: its
+        # cards carry no mailto at all, which _parse_cards requires, so they
+        # would otherwise be skipped one by one and the page read as empty.
+        contacts = _parse_person_cards(tree, base_url, domain, school, source)
     if not contacts:
         contacts = _parse_cards(tree, base_url, domain, school, source)
     return _dedupe(contacts)
@@ -962,6 +1054,73 @@ def _row_to_contact(
     return contact
 
 
+# Sidearm's web-component staff directory. Every large athletics site now
+# renders this way: one card per person, no table, and — the reason the older
+# card reader misses it — no mailto anywhere on the page. Names, titles and
+# profile links are all present in the static HTML, so the page is readable
+# without a browser once the right nodes are picked out.
+# Tried in order, first one that matches wins. They are *not* combined into one
+# comma selector: both match the same element, and selectolax hands back a
+# fresh wrapper object each time, so identity checks can't spot the duplicate
+# and every person comes out twice.
+_CARD_ROOTS = (
+    '[data-test-id="s-person-card-list__root"]',
+    '[class*="s-person-card--list"]',
+    '[class*="s-person-card"]',
+)
+_CARD_NAME = '[data-test-id="s-person-details__personal-single-line"]'
+_CARD_TITLE = '[class*="s-person-details__position"]'
+
+
+def _parse_person_cards(
+    tree: HTMLParser, base_url: str, domain: str, school: str | None, source: str
+) -> list[Contact]:
+    """Parse the Sidearm person-card layout (Texas, Georgia, Kansas State…)."""
+    cards = []
+    for selector in _CARD_ROOTS:
+        cards = tree.css(selector)
+        if cards:
+            break
+
+    out: list[Contact] = []
+    seen_nodes: set[int] = set()
+
+    for node in cards:
+        # A card can still nest inside an outer wrapper the same selector
+        # matches; keep the outermost so a person isn't emitted twice.
+        if any(id(ancestor) in seen_nodes for ancestor in _ancestors(node)):
+            continue
+        seen_nodes.add(id(node))
+
+        name_node = node.css_first(_CARD_NAME)
+        name = name_node.text(strip=True) if name_node else None
+        if not name:
+            continue
+
+        contact = _make(name, _preceding_heading(node), domain, school, source)
+
+        title_node = node.css_first(_CARD_TITLE)
+        if title_node:
+            contact.title = clean_title(title_node.text(separator=" ", strip=True))
+
+        for link in node.css("a[href]"):
+            href = link.attributes.get("href") or ""
+            if not contact.profile_url and _is_profile_link(href, domain):
+                contact.profile_url = urljoin(base_url, href).split("?")[0]
+
+        # Email and phone are usually absent here, but a few builds still
+        # include them; take them when they are there.
+        for mail in node.css('a[href^="mailto:"]'):
+            addr = (mail.attributes.get("href") or "")[len("mailto:"):].split("?")[0].lower()
+            if _email_ok(addr):
+                _add_email(contact, addr)
+        for tel in node.css('a[href^="tel:"]'):
+            _add_phone(contact, (tel.attributes.get("href") or "")[len("tel:"):])
+
+        out.append(contact)
+    return _drop_colleague_departments(out)
+
+
 def _parse_cards(
     tree: HTMLParser, base_url: str, domain: str, school: str | None, source: str
 ) -> list[Contact]:
@@ -996,7 +1155,7 @@ def _parse_cards(
             if not contact.profile_url and _is_profile_link(href, domain):
                 contact.profile_url = urljoin(base_url, href).split("?")[0]
         out.append(contact)
-    return out
+    return _drop_colleague_departments(out)
 
 
 # --- helpers -------------------------------------------------------------
@@ -1188,21 +1347,74 @@ def normalize_person_name(raw: str) -> str:
     return f"{rest} {surname}"
 
 
+def clean_group(text: str | None) -> tuple[str | None, list[str]]:
+    """Split a section heading into the group name and any address it carries.
+
+    Plenty of directories head each section with the team's own inbox —
+    Brandeis writes "Men's Soccer - menssoccer@brandeis.edu" — and the whole
+    string was being stored as the sport, so the dashboard showed the sport and
+    an email mashed together and the address itself was never usable.
+
+    Returns the group without its contact details, plus the addresses found.
+    They are a *team* inbox, never a person's, which is why :func:`_make` files
+    them as shared.
+    """
+    if not text:
+        return None, []
+    addresses = [a.lower() for a in extract.EMAIL_RE.findall(text) if _email_ok(a.lower())]
+    cleaned = extract.EMAIL_RE.sub(" ", text)
+    cleaned = extract.PHONE_RE.sub(" ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" \t-–—·|,;:/")
+    return (cleaned or None), addresses
+
+
 def _make(name: str, group: str | None, domain: str, school: str | None, source: str) -> Contact:
     contact = Contact(
         name=normalize_person_name(name), school_domain=domain, school=school, source=source
     )
+    group, group_emails = clean_group(group)
     if group:
         if _is_sport(group):
             contact.sport = group
         else:
             contact.department = group
+    for addr in group_emails:
+        # Flagged here rather than left to _flag_shared_emails, which needs the
+        # same address on three people before it calls one shared. A team inbox
+        # off a section heading is shared by construction, even where the
+        # section holds a single coach — and passing it off as their own
+        # address is exactly the mistake that flag exists to prevent.
+        _add_email(contact, addr)
+        contact.shared_email = True
     return contact
 
 
 def _is_sport(group: str) -> bool:
     lowered = group.lower()
     return any(word in lowered for word in SPORT_WORDS)
+
+
+def _drop_colleague_departments(contacts: list[Contact]) -> list[Contact]:
+    """Clear a department that is really another person on the same page.
+
+    A backstop for :func:`_is_person_block`, which has to judge one node at a
+    time. Here the whole page is in hand, so "is this heading just a colleague's
+    name?" stops being a guess: it is answered against the names actually found.
+    That keeps a real department named after a donor — "Frank Erwin Center" —
+    while dropping "Michael Norman", who is a coach two cards up.
+    """
+    names = {(c.name or "").strip().casefold() for c in contacts}
+    names.discard("")
+    for contact in contacts:
+        if not contact.department:
+            continue
+        kept = [
+            part
+            for part in (p.strip() for p in contact.department.split(";"))
+            if part and part.casefold() not in names
+        ]
+        contact.department = "; ".join(kept) or None
+    return contacts
 
 
 def _text(node) -> str:
@@ -1297,10 +1509,28 @@ def _is_person_block(node) -> bool:
     is the *previous card* and its ``<h4>`` is a name, not a sport. Andrew
     College's whole coaching staff came out with a colleague's name as their
     department that way — Adam Biss filed under "Fran Balkcom".
+
+    A mailto is not enough to recognise one. The Sidearm card layout keeps the
+    address behind the profile page — see :func:`_parse_person_cards`, where
+    "email and phone are usually absent" — so every card looked like a plain
+    container and the previous card's name was mined as the heading anyway.
+    Texas, Ole Miss, Georgia and Michigan State all filed their coaches under a
+    colleague's name. Recognise the card by its own name node or its single
+    profile link too, and keep the "exactly one" test throughout: a block
+    holding several of any of these is a list of people, not a person.
     """
     if node is None or node.tag == "-text":
         return False
-    return len(node.css('a[href^="mailto:"]')) == 1
+    if len(node.css('a[href^="mailto:"]')) == 1:
+        return True
+    if len(node.css(_CARD_NAME)) == 1:
+        return True
+    profile_links = {
+        (link.attributes.get("href") or "").split("?")[0]
+        for link in node.css("a[href]")
+        if _is_profile_link(link.attributes.get("href") or "", "")
+    }
+    return len(profile_links) == 1
 
 
 def _preceding_heading(node) -> str | None:
@@ -1368,12 +1598,52 @@ def _school_name(tree: HTMLParser, domain: str) -> str | None:
     return name
 
 
-def _looks_like_directory(html: str) -> bool:
-    """Cheap check that a candidate page is a staff list, not a 200-page 404."""
+# A Sidearm card directory links each person at /staff-directory/<slug>/<id>.
+# Several of those is as strong a signal as a column of mailto links.
+_PROFILE_LINK_RE = re.compile(r"/staff-directory/[a-z0-9-]+/\d+", re.I)
+MIN_DIRECTORY_SIGNALS = 5
+
+
+# /sports/<slug>/ also covers archive links like /sports/2024/, which are
+# seasons rather than sports.
+_SPORT_SLUG_RE = re.compile(r"/sports/([a-z][a-z0-9-]{2,40})/", re.I)
+MAX_SPORT_PAGES = 40
+# One sport's page is a short list: men's golf has a head coach and an
+# assistant. The whole-school threshold would throw those away.
+MIN_SPORT_PAGE_SIGNALS = 2
+
+
+def _sport_slugs(tree) -> list[str]:
+    """Sport slugs linked from a homepage, in a stable order."""
+    slugs: list[str] = []
+    for link in tree.css("a[href]"):
+        found = _SPORT_SLUG_RE.search(link.attributes.get("href") or "")
+        if not found:
+            continue
+        slug = found.group(1).lower()
+        if slug.isdigit() or slug in slugs:
+            continue
+        slugs.append(slug)
+    return sorted(slugs)[:MAX_SPORT_PAGES]
+
+
+def _looks_like_directory(html: str, min_signals: int = MIN_DIRECTORY_SIGNALS) -> bool:
+    """Cheap check that a candidate page is a staff list, not a 200-page 404.
+
+    ``min_signals`` is lowered for a single-sport page: men's golf legitimately
+    lists two coaches, and the whole-school threshold reads that as noise.
+    """
     lowered = html.lower()
-    if lowered.count("mailto:") >= 5:
+    if lowered.count("mailto:") >= min_signals:
         return True
-    return "staff directory" in lowered and lowered.count("<tr") >= 5
+    if "staff directory" in lowered and lowered.count("<tr") >= min_signals:
+        return True
+    # Sidearm's card template carries neither a mailto nor a table row, so the
+    # two tests above reject it outright — which is how every large athletics
+    # site came back "no staff directory found" while serving one.
+    if lowered.count("s-person-card") >= min_signals:
+        return True
+    return len(set(_PROFILE_LINK_RE.findall(lowered))) >= min_signals
 
 
 # How many people must list an address before it reads as a shared inbox

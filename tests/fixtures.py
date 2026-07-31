@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -252,8 +253,151 @@ SIDEARM_DIRECTORY = """<!doctype html>
 </body></html>
 """
 
+# Reports back what the page looks like from *inside* the browser. This is the
+# same handful of signals a commercial bot-detector reads first, so rendering
+# this page tells us whether the stealth launch flags actually took.
+WHOAMI = """<!doctype html>
+<html><head><title>Who am I</title></head><body>
+  <h1>Fingerprint probe</h1>
+  <pre id="out">pending</pre>
+  <script>
+    document.addEventListener('DOMContentLoaded', function () {
+      var uaData = navigator.userAgentData;
+      document.getElementById('out').textContent = JSON.stringify({
+        webdriver: navigator.webdriver === true,
+        ua: navigator.userAgent,
+        languages: (navigator.languages || []).join(','),
+        plugins: navigator.plugins.length,
+        innerWidth: window.innerWidth,
+        chromeObject: typeof window.chrome !== 'undefined',
+        uaDataBrands: uaData ? uaData.brands.map(function (b) {
+          return b.brand + '=' + b.version;
+        }).join(',') : ''
+      });
+    });
+  </script>
+</body></html>
+"""
+
+# Sidearm's web-component staff directory, as served by georgiadogs.com and
+# texaslonghorns.com. The two things that made every large athletics site read
+# as "no staff directory found": there is no <table>/<tr> anywhere, and not a
+# single mailto — the person's address lives on their profile page instead.
+SIDEARM_PERSON_CARDS = """<!doctype html>
+<html><head><title>Staff Directory - Bulldog Athletics</title></head><body>
+  <h1>Staff Directory</h1>
+  <h2>Administration</h2>
+  <div data-test-id="s-person-card-list__root" class="s-person-card s-person-card--list">
+    <div class="s-person-card__content">
+      <div data-test-id="s-person-details__root" class="s-person-details">
+        <div class="s-person-details__personal">
+          <a data-test-id="s-person-details__personal-single-line"
+             href="/staff-directory/josh-brooks/3">Josh Brooks</a>
+        </div>
+        <div class="s-person-details__position s-text-details">Director of Athletics</div>
+      </div>
+    </div>
+  </div>
+  <h2>Men's Basketball</h2>
+  <div data-test-id="s-person-card-list__root" class="s-person-card s-person-card--list">
+    <div class="s-person-card__content">
+      <div data-test-id="s-person-details__root" class="s-person-details">
+        <div class="s-person-details__personal">
+          <a data-test-id="s-person-details__personal-single-line"
+             href="/staff-directory/mike-white/1201">Mike White</a>
+        </div>
+        <div class="s-person-details__position s-text-details">Head Coach</div>
+      </div>
+    </div>
+  </div>
+  <div data-test-id="s-person-card-list__root" class="s-person-card s-person-card--list">
+    <div class="s-person-card__content">
+      <div data-test-id="s-person-details__root" class="s-person-details">
+        <div class="s-person-details__personal">
+          <a data-test-id="s-person-details__personal-single-line"
+             href="/staff-directory/chad-dollar/1202">Chad Dollar</a>
+        </div>
+        <div class="s-person-details__position s-text-details">Assistant Coach</div>
+      </div>
+    </div>
+  </div>
+  <h2>Volleyball</h2>
+  <div data-test-id="s-person-card-list__root" class="s-person-card s-person-card--list">
+    <div class="s-person-card__content">
+      <div data-test-id="s-person-details__root" class="s-person-details">
+        <div class="s-person-details__personal">
+          <a data-test-id="s-person-details__personal-single-line"
+             href="/staff-directory/tom-black/1203">Tom Black</a>
+        </div>
+        <div class="s-person-details__position s-text-details">Head Coach</div>
+      </div>
+    </div>
+  </div>
+  <div data-test-id="s-person-card-list__root" class="s-person-card s-person-card--list">
+    <div class="s-person-card__content">
+      <div data-test-id="s-person-details__root" class="s-person-details">
+        <div class="s-person-details__personal">
+          <a data-test-id="s-person-details__personal-single-line"
+             href="/staff-directory/kim-doyle/1204">Kim Doyle</a>
+        </div>
+        <div class="s-person-details__position s-text-details">Assistant Coach</div>
+      </div>
+    </div>
+  </div>
+</body></html>
+"""
+
+# A directory that exists only after JavaScript runs. Fetched statically it is
+# an empty shell that parses to nobody; rendered, it is an ordinary staff
+# table. This is the case `render=auto`'s visible-text heuristic misses — the
+# shell carries plenty of prose, so it never looks "too short to be real".
+JS_BUILT_DIRECTORY = """<!doctype html>
+<html><head><title>Staff Directory | Script State</title></head><body>
+  <h1>Staff Directory</h1>
+  <p>Our staff directory lists every coach and administrator across all of our
+     varsity programs. Use the filters below to narrow by sport or department.
+     Contact details are provided for media enquiries only, and are updated at
+     the start of each competitive season by the athletics communications
+     office. Please direct general questions to the main athletics switchboard
+     rather than to individual staff members during championship weeks.</p>
+  <p>Prospective student-athletes should not use this page to contact coaching
+     staff directly. Recruiting correspondence is handled through the compliance
+     office, which reviews every enquiry against conference and national
+     association rules before passing it on. Questionnaires submitted through
+     the recruiting portal reach the relevant coaching staff far faster than
+     email, and are the only route that guarantees a reply during a dead
+     period. Ticketing, parking and hospitality questions go to the box office,
+     whose staff are not listed here. Media requesting interviews should copy
+     the communications office on any approach to a coach, including during
+     the postseason, so that availability can be coordinated around travel.</p>
+  <div id="directory"></div>
+  <script>
+    var STAFF = [
+      ["Dana Reyes", "Director of Athletics", "dana.reyes@script.edu"],
+      ["Chris Vance", "Head Coach", "chris.vance@script.edu"],
+      ["Pat Oduya", "Assistant Coach", "pat.oduya@script.edu"],
+      ["Sam Webb", "Head Coach", "sam.webb@script.edu"],
+      ["Robin Ellis", "Assistant Coach", "robin.ellis@script.edu"],
+      ["Jamie Fox", "Head Coach", "jamie.fox@script.edu"]
+    ];
+    document.addEventListener('DOMContentLoaded', function () {
+      var rows = STAFF.map(function (p) {
+        return '<tr><td>' + p[0] + '</td><td>' + p[1] +
+               '</td><td><a href="mailto:' + p[2] + '">' + p[2] + '</a></td></tr>';
+      }).join('');
+      document.getElementById('directory').innerHTML =
+        '<table><thead><tr><th>Men\\'s Basketball</th><th>Name</th><th>Title</th>' +
+        '<th>Email</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    });
+  </script>
+</body></html>
+"""
+
 PAGES = {
     "/": HOME,
+    "/whoami": WHOAMI,
+    "/sidearm-cards": SIDEARM_PERSON_CARDS,
+    "/js-directory": JS_BUILT_DIRECTORY,
     "/faculty-staff": FACULTY_DIRECTORY,
     "/sidearm": SIDEARM_DIRECTORY,
     "/contact-us": CONTACT,
@@ -276,9 +420,17 @@ class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self) -> None:  # noqa: N802 - stdlib naming
+        # Every request is recorded so tests can assert on what actually went
+        # out on the wire — the anti-bot headers are only worth anything if
+        # they survive the trip through httpx.
+        self.server.requests.append((self.path, dict(self.headers)))  # type: ignore[attr-defined]
+
         path = self.path.split("?")[0].rstrip("/") or "/"
         if path == "/robots.txt":
             self._send(ROBOTS, "text/plain; charset=utf-8")
+            return
+        if path == "/gzipped":
+            self._send_gzipped(ABOUT)
             return
         if path.startswith("/images/"):
             self._send_bytes(FAKE_JPEG, "image/jpeg")
@@ -288,6 +440,25 @@ class _Handler(BaseHTTPRequestHandler):
             self._send("<h1>404</h1>", "text/html; charset=utf-8", status=404)
             return
         self._send(body, "text/html; charset=utf-8")
+
+    def _send_gzipped(self, body: str, status: int = 200) -> None:
+        """Serve gzip only if the client actually asked for it.
+
+        Mirrors what a real server does with ``Accept-Encoding``, so a client
+        that over-advertises its codecs gets caught out here.
+        """
+        raw = body.encode("utf-8")
+        encoding = None
+        if "gzip" in self.headers.get("Accept-Encoding", ""):
+            raw = gzip.compress(raw)
+            encoding = "gzip"
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        if encoding:
+            self.send_header("Content-Encoding", encoding)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
     def _send_bytes(self, raw: bytes, ctype: str, status: int = 200) -> None:
         self.send_response(status)
@@ -315,8 +486,20 @@ class FixtureSite:
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
+    @property
+    def requests(self) -> list[tuple[str, dict[str, str]]]:
+        """``(path, headers)`` for every request served, in order."""
+        if self._server is None:
+            return []
+        return list(self._server.requests)  # type: ignore[attr-defined]
+
+    def headers_for(self, path: str) -> list[dict[str, str]]:
+        """Headers of every request whose path matches, ignoring the query."""
+        return [h for p, h in self.requests if p.split("?")[0].rstrip("/") == path.rstrip("/")]
+
     def __enter__(self) -> str:
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._server.requests = []  # type: ignore[attr-defined]
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         host, port = self._server.server_address[:2]

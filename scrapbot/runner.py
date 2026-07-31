@@ -60,6 +60,21 @@ async def run_source(
     dry_run: bool = False,
 ) -> RunResult:
     settings.ensure_dirs()
+    if dry_run:
+        return await _run_source(source_name, args, settings, dry_run=True)
+    # A dry run writes nothing, so it needs no lock. Everything else does:
+    # two runs sharing a data dir overwrite each other's contacts wholesale.
+    with storage.StoreLock(settings):
+        return await _run_source(source_name, args, settings, dry_run=False)
+
+
+async def _run_source(
+    source_name: str,
+    args: argparse.Namespace,
+    settings: Settings,
+    *,
+    dry_run: bool,
+) -> RunResult:
     source_cls = sources.get(source_name)
     source = source_cls(settings, args)
     store_cls = {
@@ -72,6 +87,9 @@ async def run_source(
     result = RunResult(run_id=rid, source=source_name)
     started = time.monotonic()
 
+    checkpoint_secs = getattr(settings, "checkpoint_secs", 0) or 0
+    last_checkpoint = time.monotonic()
+
     async with Fetcher(settings) as fetcher:
         async for lead in source.run(fetcher):
             status = "-" if dry_run else store.upsert(lead)
@@ -83,6 +101,15 @@ async def run_source(
                 lead.sublabel[:28],
                 _summarize(lead),
             )
+            # Sweeps run for hours; without this the store is written once, at
+            # the very end, and an interrupted run loses everything it found.
+            if (
+                not dry_run
+                and checkpoint_secs > 0
+                and time.monotonic() - last_checkpoint >= checkpoint_secs
+            ):
+                store.save(checkpoint=True)
+                last_checkpoint = time.monotonic()
         result.fetch_stats = dict(fetcher.stats)
 
     result.outcomes = list(source.outcomes)

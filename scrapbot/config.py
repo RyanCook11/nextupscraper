@@ -1,14 +1,18 @@
 """Runtime settings for scrapbot.
 
-Everything here has a sane default, can be overridden by an environment
-variable (prefix ``SCRAPBOT_``), and can be overridden again by a CLI flag.
+Everything here has a sane default, can be overridden by ``.env`` in the
+project root, overridden again by a real environment variable (prefix
+``SCRAPBOT_``), and overridden once more by a CLI flag.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+
+log = logging.getLogger("scrapbot.config")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -16,6 +20,35 @@ DEFAULT_USER_AGENT = (
     "scrapbot/0.1 (+NextUp Recruitment lead research; "
     "contact: hello@nextuprecruitment.example)"
 )
+
+
+def _load_dotenv() -> None:
+    """Read ``.env`` from the project root, if it is there.
+
+    Done at import so every entry point gets it — the CLI, the web app and
+    the tests all reach settings through this module. A real environment
+    variable always wins, which is what ``override=False`` buys us: an
+    ``$env:SCRAPBOT_CONCURRENCY`` set for one run still beats the file.
+    """
+    env_file = PROJECT_ROOT / ".env"
+    if not env_file.exists():
+        return
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        # The file exists and the user clearly means it to be read, so a
+        # missing dependency is worth saying out loud rather than silently
+        # falling back to defaults.
+        log.warning(
+            "%s exists but python-dotenv is not installed, so it is being "
+            "ignored — run: pip install -e .",
+            env_file,
+        )
+        return
+    load_dotenv(env_file, override=False)
+
+
+_load_dotenv()
 
 
 def _env_str(name: str, default: str) -> str:
@@ -63,6 +96,19 @@ class Settings:
     render: str = field(default_factory=lambda: _env_str("RENDER", "auto"))
     """One of ``never``, ``auto`` (Playwright only when static HTML looks empty), ``always``."""
     headless: bool = field(default_factory=lambda: _env_bool("HEADLESS", True))
+
+    # --- human-mimicry timing ---------------------------------------------
+    jitter_min: float = field(default_factory=lambda: _env_float("JITTER_MIN", 0.2))
+    jitter_max: float = field(default_factory=lambda: _env_float("JITTER_MAX", 0.8))
+
+    # --- durability -------------------------------------------------------
+    checkpoint_secs: float = field(default_factory=lambda: _env_float("CHECKPOINT_SECS", 120.0))
+    """Flush the merged store this often mid-run; 0 disables.
+
+    A sweep of a couple of thousand schools runs for hours, and the store used
+    to be written only after the last site. Losing an interrupted run meant
+    losing every contact it had already found.
+    """
 
     # --- output -----------------------------------------------------------
     data_dir: Path = field(

@@ -678,6 +678,11 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)
         return 130
+    except storage.StoreBusy as exc:
+        # Not a crash — the operator started a second run by mistake. Say so
+        # plainly rather than showing them a traceback.
+        print(f"\n{exc}", file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":
