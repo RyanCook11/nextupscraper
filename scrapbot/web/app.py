@@ -212,6 +212,7 @@ def create_app(settings: Settings) -> FastAPI:
         direct_email: bool = False,
         has_email: bool = False,
         has_phone: bool = False,
+        include_departed: bool = False,
         sort: str | None = None,
         order: str = Query("asc", pattern="^(asc|desc)$"),
         limit: int = Query(500, ge=1, le=10_000),
@@ -225,6 +226,7 @@ def create_app(settings: Settings) -> FastAPI:
             coaches_only=coaches_only,
             direct_email=direct_email,
             search=search,
+            include_departed=include_departed,
         )
         by_host = _division_by_host()
         wanted = _divisions(division)
@@ -492,6 +494,7 @@ def create_app(settings: Settings) -> FastAPI:
         has_email: bool = False,
         has_phone: bool = False,
         hiring: bool = False,
+        include_departed: bool = False,
     ):
         extra: dict = {}
         if dataset == "contacts":
@@ -503,6 +506,7 @@ def create_app(settings: Settings) -> FastAPI:
                 coaches_only=coaches_only,
                 direct_email=direct_email,
                 search=search,
+                include_departed=include_departed,
             )
             # The division filter has to apply to the download too, or the
             # button quietly hands back more than the table is showing.

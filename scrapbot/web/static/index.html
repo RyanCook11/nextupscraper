@@ -70,6 +70,9 @@
   .tab[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); }
   .tab .badge { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
   .pill.coach { color: var(--good); border-color: color-mix(in srgb, var(--good) 45%, transparent); }
+  /* Only visible with "Show departed" on, so it has to read as an exception. */
+  .pill.gone { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+  tr.gone .name, tr.gone td { opacity: .55; }
   td.name { font-weight: 600; }
   .who { display: flex; gap: 8px; align-items: flex-start; }
   /* Headshots are remote and arbitrary-sized; fix the box so one tall image
@@ -151,6 +154,7 @@
     <label class="chk" id="w-email"><input type="checkbox" id="has_email" /> Has email</label>
     <label class="chk" id="w-phone"><input type="checkbox" id="has_phone" /> Has phone</label>
     <label class="chk" id="w-hiring"><input type="checkbox" id="hiring" /> Hiring signals</label>
+    <label class="chk" id="w-departed" title="People a later successful scrape no longer listed. Kept in the store, hidden by default."><input type="checkbox" id="include_departed" /> Show departed</label>
     <select id="per_page" title="Rows per page">
       <option value="20">20 / page</option>
       <option value="50" selected>50 / page</option>
@@ -190,7 +194,7 @@ function when(t) { return esc(String(t || "").replace("T", " ").replace("+00:00"
 const VIEWS = {
   contacts: {
     key: "contacts", sort: "name", endpoint: "/api/contacts",
-    filters: ["sport", "division", "coaches_only", "has_email", "has_phone"],
+    filters: ["sport", "division", "coaches_only", "has_email", "has_phone", "include_departed"],
     placeholder: "Search name, title, email, school…",
     empty: 'No coaches yet. Run <code>scrapbot run coaches --sites goduke.com</code> then refresh.',
     columns: [["name", "Name"], ["title", "Title"], ["sport", "Sport"],
@@ -199,7 +203,7 @@ const VIEWS = {
     tiles: (s) => [["Contacts", s.contacts.total], ["Coaching roles", s.contacts.coaches],
                    ["With email", s.contacts.with_email], ["With phone", s.contacts.with_phone],
                    ["Schools", s.contacts.schools]],
-    row: (c) => `<tr>
+    row: (c) => `<tr class="${c.departed ? "gone" : ""}">
       <td class="name">
         <div class="who">
           ${c.photo_url ? `<img class="shot" src="${esc(c.photo_url)}" alt="" loading="lazy"
@@ -211,7 +215,8 @@ const VIEWS = {
                   ? `<small><a href="${esc(c.source_url)}" target="_blank" rel="noopener"
                        title="This person has no profile page — this is the directory they were listed on">directory</a></small>`
                   : ""}
-            <div>${c.is_coach ? '<span class="pill coach">coach</span>' : ""}</div>
+            <div>${c.is_coach ? '<span class="pill coach">coach</span>' : ""}
+              ${c.departed ? `<span class="pill gone" title="Not listed by the last successful scrape of this school${c.departed_at ? " — noticed " + when(c.departed_at) : ""}">departed</span>` : ""}</div>
           </div>
         </div></td>
       <td>${esc(c.title || "")}</td>
@@ -305,6 +310,7 @@ const ALL_FILTERS = {
   industry: "industry", sport: "sport", division: "division",
   run: "run", status: "status",
   coaches_only: "w-coaches", has_email: "w-email", has_phone: "w-phone", hiring: "w-hiring",
+  include_departed: "w-departed",
 };
 
 function params() {
@@ -613,7 +619,7 @@ const reload = () => { page = 1; loadRows(); };
 
 let timer;
 el("q").addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(reload, 250); });
-for (const id of ["industry", "sport", "division", "run", "status", "coaches_only", "has_email", "has_phone", "hiring"])
+for (const id of ["industry", "sport", "division", "run", "status", "coaches_only", "has_email", "has_phone", "hiring", "include_departed"])
   el(id).addEventListener("change", reload);
 el("per_page").addEventListener("change", () => { perPage = Number(el("per_page").value); reload(); });
 document.querySelectorAll(".tab").forEach((t) =>

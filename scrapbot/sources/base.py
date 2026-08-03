@@ -30,9 +30,29 @@ class Source(ABC):
         report, so a site that blocked us is distinguishable from one that
         simply had nothing to find."""
 
+        self.rosters: dict[str, set[str]] = {}
+        """Everyone a successfully-scraped site listed, keyed by school domain.
+
+        This is the *complete* set the page showed, recorded before any
+        ``--coaches-only`` or ``--sport`` filter narrows what gets yielded.
+        The runner needs the whole roster to tell "not on the staff page any
+        more" from "filtered out of this run", and only what the source
+        actually saw can answer that. A source that cannot enumerate a full
+        roster simply leaves this empty and no reconciliation happens."""
+
     def record(self, outcome: SiteOutcome) -> SiteOutcome:
         self.outcomes.append(outcome)
         return outcome
+
+    def note_roster(self, contacts: list[Contact]) -> None:
+        """Record the full membership of a site we scraped successfully.
+
+        Unioned rather than replaced: a site whose staff are spread over one
+        page per sport is scraped in several passes, and each pass sees only
+        its own slice.
+        """
+        for contact in contacts:
+            self.rosters.setdefault(contact.school_domain.lower(), set()).add(contact.key)
 
     @classmethod
     def add_arguments(cls, parser: argparse.ArgumentParser) -> None:

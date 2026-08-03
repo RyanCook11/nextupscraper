@@ -49,6 +49,8 @@ CONTACT_CSV_COLUMNS = [
     "source",
     "first_seen",
     "last_seen",
+    "departed",
+    "departed_at",
 ]
 
 
@@ -284,6 +286,15 @@ class Contact:
     source: str = "unknown"
     first_seen: str = field(default_factory=_utcnow)
     last_seen: str = field(default_factory=_utcnow)
+    departed: bool = False
+    """This person was absent from a *successful* re-scrape of their school —
+    they have left the post. The record is kept rather than deleted: the email
+    and history stay useful, and a scrape is evidence, not proof. Exports and
+    the dashboard hide these unless asked. Set by the reconcile pass, cleared
+    automatically if the person shows up again."""
+    departed_at: str | None = None
+    """When the first successful scrape missed them. Not the date they left —
+    the date we noticed."""
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -355,7 +366,24 @@ class Contact:
         merged.source = other.source or merged.source
         merged.first_seen = min(merged.first_seen, other.first_seen)
         merged.last_seen = max(merged.last_seen, other.last_seen)
+        # Scraped again, so they are on the staff page again: a prior departure
+        # was either wrong or they are back. Either way the flag is stale.
+        merged.departed = False
+        merged.departed_at = None
         return merged
+
+    def mark_departed(self, when: str | None = None) -> bool:
+        """Flag this person as gone. True if that is a change.
+
+        Idempotent: a coach missing from five consecutive scrapes keeps the
+        date of the first one, which is the closest thing to a leaving date
+        the data supports.
+        """
+        if self.departed:
+            return False
+        self.departed = True
+        self.departed_at = when or _utcnow()
+        return True
 
 
 @dataclass
