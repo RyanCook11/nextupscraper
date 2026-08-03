@@ -44,6 +44,7 @@ COL = {
     "position": 10,
     "email": 11,
     "phone": 12,
+    "landing": 13,
 }
 
 
@@ -148,7 +149,10 @@ def main() -> int:
             # profile_url stays empty on purpose. The sheet's "Landing pages"
             # is the *team* page, shared by every coach at the school, and the
             # store keys on profile_url first -- using it would collapse a
-            # whole staff into a single record.
+            # whole staff into a single record. It is exactly right for
+            # source_url though: it is where the row came from, and being
+            # shared across a school is what a source page normally is.
+            source_url=cell("landing") or None,
             is_coach=is_coaching_title(title),
             source=SOURCE,
         )

@@ -145,6 +145,15 @@ def test_a_jersey_number_and_class_year_are_not_part_of_the_name():
     assert clean("Kim D'Angelo") == "Kim D'Angelo"
     assert clean("Anne-Marie O'Shea '99") == "Anne-Marie O'Shea"
 
+    # Some sites lead with the year instead of trailing it.
+    assert clean("'25 Morgan Huey") == "Morgan Huey"
+    assert clean("'00 Beth Anne Clayton") == "Beth Anne Clayton"
+    # ...and removing it can orphan the bracket that wrapped it.
+    assert clean("'05) David Richman (") == "David Richman"
+    # Bare leading digits are NOT a year: "21 Savage" is somebody's name, and a
+    # jersey number has its own "#" form.
+    assert clean("21 Savage") == "21 Savage"
+
     # The surname-comma flip still works, and sees the undecorated name.
     assert clean("O'Brien, Sean '14") == "Sean O'Brien"
     assert clean("Baker, Alycia") == "Alycia Baker"

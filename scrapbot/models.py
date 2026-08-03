@@ -41,6 +41,7 @@ CONTACT_CSV_COLUMNS = [
     "school",
     "school_domain",
     "profile_url",
+    "source_url",
     "photo_url",
     "photo_file",
     "is_coach",
@@ -263,6 +264,13 @@ class Contact:
     emails: list[str] = field(default_factory=list)
     phones: list[str] = field(default_factory=list)
     profile_url: str | None = None
+    source_url: str | None = None
+    """The page this record was read from — the staff directory itself, not the
+    person's own bio. ``profile_url`` answers "where is this coach's page";
+    this answers "where did this row come from", which is what you need to
+    check a value or re-read the source by hand. They are usually different
+    pages and one is often absent: a table row may carry no bio link at all,
+    and a record imported from a supplied list has no directory behind it."""
     photo_url: str | None = None
     """Headshot published on the staff directory. Stored as a URL; the file is
     only downloaded when the operator asks for it with ``--save-photos``."""
@@ -327,7 +335,10 @@ class Contact:
     def merge(self, other: "Contact") -> "Contact":
         """Same policy as :meth:`Lead.merge` — newest scalar wins, lists union."""
         merged = Contact.from_dict(self.to_dict())
-        for name in ("name", "school", "title", "profile_url", "photo_url", "photo_file"):
+        for name in (
+            "name", "school", "title", "profile_url", "source_url",
+            "photo_url", "photo_file",
+        ):
             new = getattr(other, name)
             if new:
                 setattr(merged, name, new)
