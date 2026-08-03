@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from scrapbot import storage
 from scrapbot.config import Settings
-from scrapbot.models import Contact, Lead, School
+from scrapbot.models import CSV_COLUMNS, SCHOOL_COLUMNS, Contact, Lead, School
 from scrapbot.web.app import create_app
 
 
@@ -383,3 +383,23 @@ def test_the_csv_download_honours_the_division_filter(client):
     body = client.get("/api/export.csv?dataset=contacts&division=DI").text
     assert "Chris Vance" in body
     assert "Sam Webb" not in body
+
+
+def test_the_contacts_csv_carries_the_division_column(client):
+    """The export has to match the screen it came from.
+
+    Division is joined from the school store rather than held on a contact, so
+    it has to be added to the CSV explicitly — record.to_row() cannot know it.
+    """
+    lines = client.get("/api/export.csv?dataset=contacts").text.splitlines()
+    assert lines[0].strip().split(",")[-1] == "division"
+    rows = {line.split(",")[0]: line.rstrip().split(",")[-1] for line in lines[1:]}
+    assert rows["Chris Vance"] == "DI"   # troytrojans.com is on record
+    assert rows["Sam Webb"] == ""        # state.edu is not — blank, not missing
+
+
+def test_the_other_exports_are_unaffected_by_the_joined_column(client):
+    """Only contacts gain it; leads and schools keep their own schema."""
+    for dataset, expected in (("leads", CSV_COLUMNS), ("schools", SCHOOL_COLUMNS)):
+        header = client.get(f"/api/export.csv?dataset={dataset}").text.splitlines()[0]
+        assert header.strip().split(",") == list(expected)

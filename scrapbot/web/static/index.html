@@ -83,6 +83,9 @@
   .pill.retry   { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
   .hint { color: var(--muted); font-size: 12px; margin: -8px 0 14px; }
   .hint code { user-select: all; }
+  /* A stale server is not a passing note — it makes every other reading on the
+     page wrong, so it gets the same weight as a failure. */
+  .hint.err { color: var(--bad); font-size: 13px; }
   button.act { cursor: pointer; font: inherit; }
   button.pill.act { background: none; }
   button.pill.act:hover { background: color-mix(in srgb, var(--accent) 15%, transparent); }
@@ -202,7 +205,12 @@ const VIEWS = {
           ${c.photo_url ? `<img class="shot" src="${esc(c.photo_url)}" alt="" loading="lazy"
              referrerpolicy="no-referrer" onerror="this.remove()">` : ""}
           <div>${esc(c.name)}
-            ${c.profile_url ? `<small><a href="${esc(c.profile_url)}" target="_blank" rel="noopener">profile</a></small>` : ""}
+            ${c.profile_url
+                ? `<small><a href="${esc(c.profile_url)}" target="_blank" rel="noopener">profile</a></small>`
+                : c.source_url && /^https?:/i.test(c.source_url)
+                  ? `<small><a href="${esc(c.source_url)}" target="_blank" rel="noopener"
+                       title="This person has no profile page — this is the directory they were listed on">directory</a></small>`
+                  : ""}
             <div>${c.is_coach ? '<span class="pill coach">coach</span>' : ""}</div>
           </div>
         </div></td>
@@ -441,6 +449,26 @@ async function loadRows() {
       : "";
   } else {
     el("hint").hidden = true;
+    // This page and the server it is talking to are versioned together, but
+    // they restart separately: reloading the browser picks up a new UI while
+    // the old `scrapbot dashboard` process keeps answering. The symptom is a
+    // column that renders empty on every row and a filter that changes
+    // nothing — indistinguishable, on screen, from a broken feature. The
+    // server names the fields it can supply, so mismatches are detectable;
+    // say so rather than let it look like a bug.
+    const missing = view.columns
+      .map(([k]) => k)
+      .filter((k) => data.columns && !data.columns.includes(k));
+    if (missing.length) {
+      el("hint").hidden = false;
+      el("hint").className = "hint err";
+      el("hint").innerHTML =
+        `This page expects <code>${missing.map(esc).join("</code>, <code>")}</code>, ` +
+        `which the running server does not provide — it is older than the page. ` +
+        `Restart it: stop <code>scrapbot dashboard</code> and start it again.`;
+    } else {
+      el("hint").className = "hint";
+    }
   }
   const noun = view.key === "leads" ? "lead" : view.key.replace(/s$/, "");
   const from = total ? (page - 1) * perPage + 1 : 0;

@@ -925,6 +925,13 @@ def parse_directory(
         contacts = _parse_person_cards(tree, base_url, domain, school, source)
     if not contacts:
         contacts = _parse_cards(tree, base_url, domain, school, source)
+    # Every layout reads from one page, so stamp it once here rather than
+    # threading it through three parsers. This is the directory, not the
+    # person's bio: it is what you open to check a value or see the row in
+    # context, and for the many people who have no bio link it is the only
+    # provenance the record carries.
+    for contact in contacts:
+        contact.source_url = base_url
     return _dedupe(contacts)
 
 
@@ -1428,14 +1435,24 @@ _NAME_SUFFIX_RE = re.compile(
 # end, so "O'Melia" and "D'Angelo" keep theirs.
 _NAME_JERSEY_RE = re.compile(r"^#\s*\d{1,3}\s+")
 _NAME_CLASS_YEAR_RE = re.compile(r"\s*['‘’ʼ]\s*\d{2}\s*$")
+# Some sites lead with it instead — Bethany and Freed-Hardeman publish
+# "'25 Morgan Huey". The apostrophe is required here: bare leading digits are
+# not safe to drop, because "21 Savage" is somebody's name and a jersey number
+# already has its own "#" form above.
+_NAME_LEADING_YEAR_RE = re.compile(r"^\s*['‘’ʼ]\s*\d{2}\s*[),.\]]?\s+")
 
 
 def strip_name_decorations(name: str) -> str:
-    """Drop a leading jersey number and a trailing class year."""
-    cleaned = _NAME_JERSEY_RE.sub("", name)
+    """Drop a jersey number or class year, leading or trailing."""
+    cleaned = _NAME_LEADING_YEAR_RE.sub("", _NAME_JERSEY_RE.sub("", name))
     # "'19 '23" would need two passes; run until it settles.
     while (trimmed := _NAME_CLASS_YEAR_RE.sub("", cleaned)) != cleaned:
         cleaned = trimmed
+    # Removing the year can orphan the bracket that wrapped it — gobison.com
+    # publishes "('05) David Richman", which leaves a trailing "(" behind.
+    for opener, closer in (("(", ")"), ("[", "]")):
+        while cleaned.count(opener) > cleaned.count(closer) and cleaned.endswith(opener):
+            cleaned = cleaned[:-1].strip()
     return cleaned.strip() or name
 
 

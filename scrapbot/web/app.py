@@ -57,6 +57,20 @@ def _sort_key(value) -> str:
     return str(value).lower()
 
 
+def _sorted(records: list, key, order: str) -> list:
+    """:func:`_page`'s ordering, applied to records instead of dicts.
+
+    Same contract — blanks sink to the bottom whichever way the sort points —
+    but it never materialises a dict per record, so a store of 80,000 contacts
+    can be sorted to return a page of 50 without serialising all of them.
+    """
+    keyed = [(_sort_key(key(record)), index, record) for index, record in enumerate(records)]
+    filled = [k for k in keyed if k[0]]
+    blank = [k for k in keyed if not k[0]]
+    filled.sort(key=lambda k: k[0], reverse=order == "desc")
+    return [k[2] for k in filled + blank]
+
+
 def _page(rows: list[dict], sort: str | None, order: str, offset: int, limit: int) -> list[dict]:
     """Sort the whole result set, then hand back one window of it.
 
@@ -78,14 +92,42 @@ def create_app(settings: Settings) -> FastAPI:
     app = FastAPI(title="scrapbot", docs_url="/api/docs", redoc_url=None)
     jobs = JobManager(settings)
 
+    # Every endpoint re-read its whole store from disk on every request. At
+    # 80,000 contacts that is a 51 MB JSON parse per call — about two seconds —
+    # so changing a filter left the table showing the old rows for long enough
+    # to read as "the filter does nothing". The dashboard is a reader; the files
+    # only change when a run writes them, so the parse belongs behind a cache.
+    #
+    # Keyed on the file's modification time rather than a timer, so a scrape
+    # that finishes while the page is open is picked up on the next request and
+    # a file that has not changed is never parsed twice. st_mtime_ns, not
+    # st_mtime: a run writing twice inside one filesystem tick would otherwise
+    # look unchanged.
+    cache: dict[str, tuple[int, int, list]] = {}
+
+    def _load_cached(name: str, store_cls):
+        store = store_cls(settings)
+        path = store.json_path
+        try:
+            stat = path.stat()
+            stamp = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            stamp = (0, 0)
+        hit = cache.get(name)
+        if hit is not None and hit[:2] == stamp:
+            return hit[2]
+        records = store.load().sorted_leads()
+        cache[name] = (*stamp, records)
+        return records
+
     def load():
-        return storage.LeadStore(settings).load().sorted_leads()
+        return _load_cached("leads", storage.LeadStore)
 
     def load_contacts():
-        return storage.ContactStore(settings).load().sorted_leads()
+        return _load_cached("contacts", storage.ContactStore)
 
     def load_schools():
-        return storage.SchoolStore(settings).load().sorted_leads()
+        return _load_cached("schools", storage.SchoolStore)
 
     def _division_by_host() -> dict[str, str]:
         """``goduke.com -> "DI"``, from the school store.
@@ -117,7 +159,19 @@ def create_app(settings: Settings) -> FastAPI:
         page = STATIC_DIR / "index.html"
         if not page.exists():  # pragma: no cover
             return HTMLResponse("<h1>dashboard assets missing</h1>", status_code=500)
-        return FileResponse(page)
+        # The whole dashboard — markup, styles and script — is this one file, so
+        # a cached copy is a cached *application*. FileResponse sends
+        # Last-Modified and an ETag but no Cache-Control, and a browser given
+        # that combination is free to reuse the page without asking. The result
+        # is that a change ships, the operator reloads, and the old UI comes
+        # back: a filter added here simply does not appear, with nothing on
+        # screen to explain why.
+        #
+        # "no-cache" is revalidate-every-time, not don't-store. FileResponse
+        # does not answer If-None-Match, so revalidation costs a full 27 KB
+        # rather than a 304 — on a dashboard bound to localhost that is a fair
+        # price for never serving a stale application.
+        return FileResponse(page, headers={"Cache-Control": "no-cache"})
 
     @app.get("/api/leads")
     def api_leads(
@@ -173,18 +227,30 @@ def create_app(settings: Settings) -> FastAPI:
             search=search,
         )
         by_host = _division_by_host()
-        rows = [{**c.to_dict(), "division": by_host.get(c.school_domain)} for c in contacts]
         wanted = _divisions(division)
         if wanted:
-            rows = [r for r in rows if r["division"] in wanted]
+            contacts = [c for c in contacts if by_host.get(c.school_domain) in wanted]
+
+        # Sort and slice the records themselves, and only build dicts for the
+        # page being returned. Serialising all 80,000 to hand back 50 cost most
+        # of a second per request, which is the difference between a filter that
+        # responds and one that looks broken.
+        total = len(contacts)
+        if sort == "division":
+            contacts = _sorted(contacts, lambda c: by_host.get(c.school_domain), order)
+        elif sort:
+            contacts = _sorted(contacts, lambda c: getattr(c, sort, None), order)
+        window = contacts[offset : offset + limit]
         return {
-            "total": len(rows),
+            "total": total,
             "offset": offset,
             "limit": limit,
             # Division is joined from the school store, not stored on a contact,
             # so it is appended here rather than added to the CSV schema.
             "columns": CONTACT_CSV_COLUMNS + ["division"],
-            "contacts": _page(rows, sort, order, offset, limit),
+            "contacts": [
+                {**c.to_dict(), "division": by_host.get(c.school_domain)} for c in window
+            ],
         }
 
     @app.get("/api/schools")
@@ -427,6 +493,7 @@ def create_app(settings: Settings) -> FastAPI:
         has_phone: bool = False,
         hiring: bool = False,
     ):
+        extra: dict = {}
         if dataset == "contacts":
             records = filter_contacts(
                 load_contacts(),
@@ -439,11 +506,14 @@ def create_app(settings: Settings) -> FastAPI:
             )
             # The division filter has to apply to the download too, or the
             # button quietly hands back more than the table is showing.
+            by_host = _division_by_host()
             wanted = _divisions(division)
             if wanted:
-                by_host = _division_by_host()
                 records = [c for c in records if by_host.get(c.school_domain) in wanted]
-            columns = CONTACT_CSV_COLUMNS
+            # ...and the column has to come with it. A CSV that omits what the
+            # table shows is the export not matching the screen it came from.
+            columns = CONTACT_CSV_COLUMNS + ["division"]
+            extra = {"division": lambda c: by_host.get(c.school_domain) or ""}
         elif dataset == "schools":
             records = load_schools()
             wanted = _divisions(division)
@@ -472,7 +542,10 @@ def create_app(settings: Settings) -> FastAPI:
         writer = _csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()
         for record in records:
-            writer.writerow(record.to_row())
+            row = record.to_row()
+            # Columns joined from another store rather than held on the record.
+            row.update({name: get(record) for name, get in extra.items()})
+            writer.writerow(row)
         buffer.seek(0)
         return StreamingResponse(
             iter([buffer.getvalue()]),
