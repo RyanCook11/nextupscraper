@@ -124,6 +124,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Contacts only: skip shared inboxes and assistants' addresses.",
     )
+    departed = export.add_mutually_exclusive_group()
+    departed.add_argument(
+        "--include-departed",
+        action="store_true",
+        help="Contacts only: also include people a later scrape stopped listing. "
+        "They are left out by default.",
+    )
+    departed.add_argument(
+        "--departed-only",
+        action="store_true",
+        help="Contacts only: only people who have left — a review list of who "
+        "dropped off the staff pages.",
+    )
     export.set_defaults(func=cmd_export)
 
     # --- dashboard -------------------------------------------------------
@@ -144,6 +157,22 @@ def _run_only_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
         "--dry-run", action="store_true", default=S, help="Scrape but write nothing."
+    )
+    parser.add_argument(
+        "--no-reconcile",
+        action="store_true",
+        default=S,
+        help="Do not mark people a successful re-scrape stopped listing. By "
+        "default they are flagged as departed (never deleted).",
+    )
+    parser.add_argument(
+        "--reconcile-max-loss",
+        type=float,
+        default=S,
+        metavar="RATIO",
+        help="Skip reconciling a school that would lose more than this share of "
+        "its people in one run (default 0.5) — that pattern is usually a site "
+        "or parser change, not mass firing. Pass 1.0 to mark them anyway.",
     )
     return parser
 
@@ -253,6 +282,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"  {noun + ' yielded':<16}: {len(result.leads)}")
     print(f"  with contact    : {result.with_contact}")
     print(f"  new / updated   : {result.new} / {result.updated}")
+    _print_reconcile(result)
     stats = result.fetch_stats
     print(
         "  requests        : {requests} ({rendered} rendered, {blocked} robots-blocked, "
@@ -279,6 +309,26 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"  merged store    : {store_path}")
         print(f"\nReview it with: {review}")
     return 0
+
+
+def _print_reconcile(result) -> None:
+    """Departures and returns, plus any school the safety catch spared."""
+    report = result.reconcile
+    if result.returned:
+        print(f"  returned        : {result.returned} (were marked departed, listed again)")
+    if report is None:
+        return
+    if report.total:
+        print(
+            f"  departed        : {report.total} across {len(report.departed)} school(s) "
+            f"— no longer listed, flagged not deleted"
+        )
+    if report.skipped:
+        print(f"  NOT reconciled  : {len(report.skipped)} school(s) lost too many at once")
+        for domain, (missing, stored) in sorted(
+            report.skipped.items(), key=lambda kv: -kv[1][0]
+        )[:10]:
+            print(f"    {domain:<32} {missing} of {stored} missing — check the site by hand")
 
 
 def _print_site_report(result) -> None:
@@ -533,6 +583,11 @@ def _contact_stats(settings: Settings) -> int:
         )
         return 0
 
+    # Everything below counts people currently in post. Departed records are
+    # kept, but folding them into "coaching roles" would overstate the roster
+    # by however many staff have turned over since the first run.
+    departed = [c for c in contacts if c.departed]
+    contacts = [c for c in contacts if not c.departed]
     coaches = [c for c in contacts if c.is_coach]
     with_email = sum(1 for c in contacts if c.emails)
     with_phone = sum(1 for c in contacts if c.phones)
@@ -542,6 +597,11 @@ def _contact_stats(settings: Settings) -> int:
     print(f"  coaching roles  : {len(coaches)} ({_pct(len(coaches), len(contacts))})")
     print(f"  with email      : {with_email} ({_pct(with_email, len(contacts))})")
     print(f"  with phone      : {with_phone} ({_pct(with_phone, len(contacts))})")
+    if departed:
+        print(
+            f"  departed        : {len(departed)} kept but not listed any more "
+            f"(scrapbot export --contacts --departed-only)"
+        )
 
     counts: dict[str, int] = {}
     for contact in contacts:
@@ -604,6 +664,8 @@ def _export_contacts(args: argparse.Namespace, settings: Settings) -> int:
         coaches_only=args.coaches_only,
         direct_email=args.direct_email,
         search=args.search,
+        include_departed=args.include_departed,
+        departed_only=args.departed_only,
     )
     out: Path = args.out
     if out.suffix.lower() == ".json":
@@ -661,8 +723,17 @@ def filter_contacts(
     coaches_only: bool = False,
     direct_email: bool = False,
     search: str | None = None,
+    include_departed: bool = False,
+    departed_only: bool = False,
 ) -> list[Contact]:
     out = contacts
+    # Departed people are hidden unless asked for. They are still in the store
+    # — flagged, not deleted — but an outgoing list of coaches should mean the
+    # ones actually in post.
+    if departed_only:
+        out = [c for c in out if c.departed]
+    elif not include_departed:
+        out = [c for c in out if not c.departed]
     if has_email:
         out = [c for c in out if c.emails]
     if direct_email:

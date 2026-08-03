@@ -6,6 +6,7 @@ import csv
 import json
 import logging
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -138,6 +139,7 @@ class RecordStore:
         self.leads: dict[str, Record] = {}
         self.new_count = 0
         self.updated_count = 0
+        self.returned_count = 0
 
     # -- where this store lives -------------------------------------------
     @property
@@ -175,6 +177,9 @@ class RecordStore:
             self.leads[lead.key] = lead
             self.new_count += 1
             return "new"
+        if getattr(existing, "departed", False):
+            # merge() clears the flag; count it here, while we can still see it.
+            self.returned_count += 1
         self.leads[lead.key] = existing.merge(lead)
         self.updated_count += 1
         return "updated"
@@ -226,6 +231,92 @@ class ContactStore(RecordStore):
     @property
     def csv_path(self) -> Path:
         return self.settings.contacts_csv_path
+
+    def reconcile(
+        self,
+        rosters: dict[str, set[str]],
+        *,
+        max_loss: float = 0.5,
+        floor: int = 5,
+    ) -> "ReconcileReport":
+        """Mark people the school no longer lists as departed.
+
+        Merging alone only ever touches records that *were* scraped, so a
+        coach who is fired just stops being updated and lingers forever. This
+        closes that gap from the other side: for a school we scraped
+        successfully, anyone in the store who was absent from the page has
+        left the post.
+
+        ``rosters`` must hold the complete membership of each site — only
+        schools the run actually reached, and every person the directory
+        listed, before any ``--coaches-only``-style filter. A school missing
+        from it is left alone, which is what makes a blocked or failed site
+        harmless.
+
+        Records are flagged, never deleted: the email stays useful, and a
+        scrape is evidence rather than proof.
+
+        ``max_loss`` is the safety catch. A site redesign that halves what the
+        parser recognises looks exactly like mass firing, and the difference
+        matters far too much to guess — so if a school would lose more than
+        this fraction of its people at once, the whole school is skipped and
+        reported instead. ``floor`` exempts schools too small for a ratio to
+        mean anything: with three people on file, one departure is 33% and
+        two is 67%, and neither is suspicious.
+        """
+        report = ReconcileReport()
+        by_domain: dict[str, list[Contact]] = {}
+        for contact in self.leads.values():
+            if not contact.departed:
+                by_domain.setdefault(contact.school_domain.lower(), []).append(contact)
+
+        for domain, seen in rosters.items():
+            if not seen:
+                continue  # nothing parsed: says nothing about who is still there
+            stored = by_domain.get(domain, [])
+            missing = [c for c in stored if c.key not in seen]
+            if not missing:
+                continue
+            if len(stored) >= floor and len(missing) / len(stored) > max_loss:
+                log.warning(
+                    "%s: %d of %d stored people missing from this scrape (>%.0f%%) — "
+                    "leaving them alone. A parser or site change is likelier than "
+                    "that many departures; re-run with --reconcile-max-loss 1.0 if "
+                    "the scrape is right.",
+                    domain, len(missing), len(stored), max_loss * 100,
+                )
+                report.skipped[domain] = (len(missing), len(stored))
+                continue
+            marked = sum(1 for c in missing if c.mark_departed())
+            if marked:
+                report.departed[domain] = marked
+                log.info("%s: %d person(s) no longer listed — marked departed", domain, marked)
+        return report
+
+
+@dataclass
+class ReconcileReport:
+    """What one reconcile pass changed, for the run summary."""
+
+    departed: dict[str, int] = field(default_factory=dict)
+    """School domain -> how many people were newly marked as gone."""
+    skipped: dict[str, tuple[int, int]] = field(default_factory=dict)
+    """School domain -> (missing, stored) for schools the safety catch spared."""
+
+    @property
+    def total(self) -> int:
+        return sum(self.departed.values())
+
+    def to_dict(self) -> dict:
+        return {
+            "departed": self.total,
+            "schools_reconciled": len(self.departed),
+            "by_school": self.departed,
+            "skipped_suspicious": {
+                domain: {"missing": missing, "stored": stored}
+                for domain, (missing, stored) in self.skipped.items()
+            },
+        }
 
 
 class SchoolStore(RecordStore):

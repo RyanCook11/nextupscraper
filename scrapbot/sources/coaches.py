@@ -469,6 +469,7 @@ class CoachesSource(Source):
             "%s: %d people (%d with email) from saved page %s",
             domain, len(contacts), with_email, path.name,
         )
+        self.note_roster(contacts)
         self.record(
             SiteOutcome(
                 domain=domain,
@@ -659,6 +660,9 @@ class CoachesSource(Source):
                 "%s: %d people (%d with email) from %s [%s]",
                 domain, len(contacts), with_email, page.url, kind,
             )
+            # Before _wanted() narrows the stream: reconciliation compares
+            # against everyone the directory listed, not everyone we kept.
+            self.note_roster(contacts)
             self.record(
                 SiteOutcome(
                     domain=seed,

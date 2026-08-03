@@ -23,10 +23,15 @@ class RunResult:
     leads: list[Lead | Contact | School] = field(default_factory=list)
     new: int = 0
     updated: int = 0
+    departed: int = 0
+    """People marked as gone because a successful re-scrape no longer listed them."""
+    returned: int = 0
+    """People previously marked departed who turned up again — the flag is cleared."""
     seconds: float = 0.0
     fetch_stats: dict = field(default_factory=dict)
     out_dir: Path | None = None
     outcomes: list[SiteOutcome] = field(default_factory=list)
+    reconcile: storage.ReconcileReport | None = None
 
     @property
     def with_contact(self) -> int:
@@ -114,9 +119,31 @@ async def _run_source(
         result.fetch_stats["cache"] = fetcher.cache.stats()
 
     result.outcomes = list(source.outcomes)
+
+    # Reconcile before the counters are read: a coach the school stopped
+    # listing has left, and merging alone can never notice that, because it
+    # only ever sees records that *were* scraped.
+    #
+    # Only successful sites are eligible, and that is enforced at the source:
+    # note_roster() is called on the OK path and nowhere else, so a blocked,
+    # empty or crashed site contributes no roster and its people are never
+    # touched. Filtering again here against outcome domains would be worse
+    # than redundant — a site reached through a host mapping files its outcome
+    # under the seed domain but its people under the athletics host, so the
+    # intersection would silently drop schools that scraped perfectly well.
+    if not dry_run and getattr(source, "rosters", None) and not getattr(
+        args, "no_reconcile", False
+    ):
+        result.reconcile = store.reconcile(
+            source.rosters,
+            max_loss=getattr(args, "reconcile_max_loss", 0.5),
+        )
+        result.departed = result.reconcile.total
+
     result.seconds = time.monotonic() - started
     result.new = store.new_count
     result.updated = store.updated_count
+    result.returned = store.returned_count
 
     if dry_run:
         log.info("dry run — nothing written to %s", settings.data_dir)
@@ -144,6 +171,8 @@ async def _run_source(
             "leads": len(result.leads),
             "new": result.new,
             "updated": result.updated,
+            "returned": result.returned,
+            "reconcile": result.reconcile.to_dict() if result.reconcile else None,
             "seconds": round(result.seconds, 1),
             "fetch_stats": result.fetch_stats,
         },
